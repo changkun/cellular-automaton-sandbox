@@ -4,6 +4,7 @@
 import argparse
 import curses
 import json
+import os
 import random
 from collections import Counter
 
@@ -70,6 +71,35 @@ PATTERNS = {
         (8, 12), (8, 13),
     ],
 }
+
+CUSTOM_PATTERNS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patterns.json")
+
+
+def load_custom_patterns() -> dict[str, list[tuple[int, int]]]:
+    """Load user-created patterns from patterns.json."""
+    try:
+        with open(CUSTOM_PATTERNS_FILE, "r") as f:
+            data = json.load(f)
+        return {name: [tuple(c) for c in cells] for name, cells in data.items()}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_custom_patterns(patterns: dict[str, list[tuple[int, int]]]) -> None:
+    """Save user-created patterns to patterns.json."""
+    data = {name: [list(c) for c in cells] for name, cells in patterns.items()}
+    with open(CUSTOM_PATTERNS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def get_all_patterns() -> tuple[dict[str, list[tuple[int, int]]], list[str]]:
+    """Return merged built-in + custom patterns and ordered name list."""
+    custom = load_custom_patterns()
+    merged = dict(PATTERNS)
+    merged.update(custom)
+    names = list(PATTERNS.keys()) + [n for n in custom if n not in PATTERNS]
+    return merged, names
+
 
 PATTERN_NAMES = list(PATTERNS.keys())
 
@@ -188,6 +218,17 @@ class App:
         self.history_pos: int = -1  # -1 means live (not rewound)
         # Population history for sparkline
         self.pop_history: list[int] = []
+        # Pattern library (built-in + custom, refreshed on changes)
+        self._refresh_patterns()
+        # Blueprint mode state
+        self.blueprint_mode = False
+        self.blueprint_cells: set[tuple[int, int]] = set()  # cells drawn in blueprint
+        self.sel_corner1: tuple[int, int] | None = None  # first selection corner
+        self.sel_corner2: tuple[int, int] | None = None  # second selection corner
+
+    def _refresh_patterns(self) -> None:
+        """Reload merged pattern library from built-in + custom patterns."""
+        self.all_patterns, self.all_pattern_names = get_all_patterns()
 
     # --- main loop ---
 
@@ -247,6 +288,10 @@ class App:
         if key == -1:
             return True
 
+        # Blueprint mode has its own input handler
+        if self.blueprint_mode:
+            return self._handle_blueprint_input(key)
+
         # Quit
         if key == ord("q"):
             return False
@@ -294,7 +339,7 @@ class App:
         # Place cell or pattern
         elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
             if self.pattern_idx is not None:
-                pat = PATTERNS[PATTERN_NAMES[self.pattern_idx]]
+                pat = self.all_patterns[self.all_pattern_names[self.pattern_idx]]
                 self.grid.place_pattern(pat, self.cursor_r, self.cursor_c)
             else:
                 self.grid.toggle_cell(self.cursor_r, self.cursor_c)
@@ -304,12 +349,12 @@ class App:
             if self.pattern_idx is None:
                 self.pattern_idx = 0
             else:
-                self.pattern_idx = (self.pattern_idx - 1) % len(PATTERN_NAMES)
+                self.pattern_idx = (self.pattern_idx - 1) % len(self.all_pattern_names)
         elif key == ord("n"):
             if self.pattern_idx is None:
                 self.pattern_idx = 0
             else:
-                self.pattern_idx = (self.pattern_idx + 1) % len(PATTERN_NAMES)
+                self.pattern_idx = (self.pattern_idx + 1) % len(self.all_pattern_names)
 
         # Deselect pattern
         elif key == 27:  # Escape
@@ -341,11 +386,213 @@ class App:
         elif key == ord("o"):
             self._load()
 
+        # Enter blueprint mode
+        elif key == ord("b"):
+            self._enter_blueprint()
+
+        # Delete custom pattern
+        elif key == ord("x"):
+            self._delete_custom_pattern()
+
         # Resize
         elif key == curses.KEY_RESIZE:
             pass  # viewport recalculated each frame
 
         return True
+
+    def _handle_blueprint_input(self, key: int) -> bool:
+        """Handle input while in blueprint mode."""
+        # Movement
+        if key in (curses.KEY_UP, ord("k")):
+            self.cursor_r = max(0, self.cursor_r - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.cursor_r = min(self.grid.height - 1, self.cursor_r + 1)
+        elif key in (curses.KEY_LEFT, ord("h")):
+            self.cursor_c = max(0, self.cursor_c - 1)
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            self.cursor_c = min(self.grid.width - 1, self.cursor_c + 1)
+
+        # Toggle cell in blueprint canvas
+        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+            pos = (self.cursor_r, self.cursor_c)
+            if pos in self.blueprint_cells:
+                self.blueprint_cells.discard(pos)
+            else:
+                self.blueprint_cells.add(pos)
+
+        # Mark selection corner
+        elif key == ord("m"):
+            if self.sel_corner1 is None:
+                self.sel_corner1 = (self.cursor_r, self.cursor_c)
+                self._set_message("Selection start marked — move to opposite corner and press [M] again")
+            else:
+                self.sel_corner2 = (self.cursor_r, self.cursor_c)
+                r1 = min(self.sel_corner1[0], self.sel_corner2[0])
+                r2 = max(self.sel_corner1[0], self.sel_corner2[0])
+                c1 = min(self.sel_corner1[1], self.sel_corner2[1])
+                c2 = max(self.sel_corner1[1], self.sel_corner2[1])
+                count = sum(1 for (r, c) in self.blueprint_cells if r1 <= r <= r2 and c1 <= c <= c2)
+                self._set_message(f"Region selected ({r2-r1+1}x{c2-c1+1}, {count} cells) — press [B] to save")
+
+        # Select all drawn cells (no region marking needed)
+        elif key == ord("a"):
+            if self.blueprint_cells:
+                min_r = min(r for r, c in self.blueprint_cells)
+                max_r = max(r for r, c in self.blueprint_cells)
+                min_c = min(c for r, c in self.blueprint_cells)
+                max_c = max(c for r, c in self.blueprint_cells)
+                self.sel_corner1 = (min_r, min_c)
+                self.sel_corner2 = (max_r, max_c)
+                self._set_message(f"All cells selected ({max_r-min_r+1}x{max_c-min_c+1}) — press [B] to save")
+            else:
+                self._set_message("No cells drawn yet")
+
+        # Clear blueprint canvas
+        elif key == ord("c"):
+            self.blueprint_cells.clear()
+            self.sel_corner1 = None
+            self.sel_corner2 = None
+            self._set_message("Blueprint cleared")
+
+        # Save pattern and exit blueprint mode
+        elif key == ord("b"):
+            self._save_blueprint()
+
+        # Cancel blueprint mode
+        elif key == 27:  # Escape
+            self.blueprint_mode = False
+            self.blueprint_cells.clear()
+            self.sel_corner1 = None
+            self.sel_corner2 = None
+            self._set_message("Blueprint mode cancelled")
+
+        elif key == curses.KEY_RESIZE:
+            pass
+
+        return True
+
+    # --- blueprint mode ---
+
+    def _enter_blueprint(self) -> None:
+        """Enter blueprint drawing mode."""
+        self.running = False
+        self.blueprint_mode = True
+        self.blueprint_cells.clear()
+        self.sel_corner1 = None
+        self.sel_corner2 = None
+        self._set_message("BLUEPRINT MODE — draw with [Enter], [M]ark corners, [A]ll, [B] save, [Esc] cancel")
+
+    def _save_blueprint(self) -> None:
+        """Extract selected cells, prompt for name, save to custom patterns."""
+        # Determine which cells to save
+        if self.sel_corner1 is not None and self.sel_corner2 is not None:
+            r1 = min(self.sel_corner1[0], self.sel_corner2[0])
+            r2 = max(self.sel_corner1[0], self.sel_corner2[0])
+            c1 = min(self.sel_corner1[1], self.sel_corner2[1])
+            c2 = max(self.sel_corner1[1], self.sel_corner2[1])
+            selected = [(r, c) for r, c in self.blueprint_cells if r1 <= r <= r2 and c1 <= c <= c2]
+        elif self.blueprint_cells:
+            selected = list(self.blueprint_cells)
+            r1 = min(r for r, c in selected)
+            c1 = min(c for r, c in selected)
+        else:
+            self._set_message("No cells to save — draw some first!")
+            return
+
+        if not selected:
+            self._set_message("No cells in selection region!")
+            return
+
+        # Normalize offsets relative to top-left of selection
+        if self.sel_corner1 is not None:
+            origin_r, origin_c = r1, c1
+        else:
+            origin_r = min(r for r, c in selected)
+            origin_c = min(c for r, c in selected)
+        offsets = sorted([(r - origin_r, c - origin_c) for r, c in selected])
+
+        # Prompt for pattern name
+        name = self._text_prompt("Pattern name: ")
+        if not name:
+            self._set_message("Save cancelled — no name given")
+            return
+
+        # Check for name conflict with built-in patterns
+        if name in PATTERNS:
+            self._set_message(f"Cannot overwrite built-in pattern '{name}'")
+            return
+
+        # Save to custom patterns
+        custom = load_custom_patterns()
+        custom[name] = offsets
+        try:
+            save_custom_patterns(custom)
+        except OSError as e:
+            self._set_message(f"Save error: {e}")
+            return
+
+        self._refresh_patterns()
+        self.blueprint_mode = False
+        self.blueprint_cells.clear()
+        self.sel_corner1 = None
+        self.sel_corner2 = None
+        self._set_message(f"Saved pattern '{name}' ({len(offsets)} cells)")
+
+    def _delete_custom_pattern(self) -> None:
+        """Delete the currently selected custom pattern (if it's not built-in)."""
+        if self.pattern_idx is None:
+            self._set_message("No pattern selected — use [P/N] first")
+            return
+        name = self.all_pattern_names[self.pattern_idx]
+        if name in PATTERNS:
+            self._set_message(f"Cannot delete built-in pattern '{name}'")
+            return
+        custom = load_custom_patterns()
+        if name not in custom:
+            self._set_message(f"Pattern '{name}' not found in custom library")
+            return
+        custom.pop(name)
+        try:
+            save_custom_patterns(custom)
+        except OSError as e:
+            self._set_message(f"Delete error: {e}")
+            return
+        self._refresh_patterns()
+        self.pattern_idx = min(self.pattern_idx, len(self.all_pattern_names) - 1)
+        if not self.all_pattern_names:
+            self.pattern_idx = None
+        self._set_message(f"Deleted custom pattern '{name}'")
+
+    def _text_prompt(self, prompt: str) -> str:
+        """Show a text input prompt at the bottom of the screen. Returns entered text or empty string."""
+        curses.curs_set(1)
+        self.stdscr.nodelay(False)
+        max_h, max_w = self.stdscr.getmaxyx()
+        y = max_h - 1
+        text = ""
+        while True:
+            try:
+                self.stdscr.move(y, 0)
+                self.stdscr.clrtoeol()
+                display = (prompt + text)[:max_w - 2]
+                self.stdscr.addstr(y, 0, display, curses.A_BOLD)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            ch = self.stdscr.getch()
+            if ch in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+                break
+            elif ch == 27:  # Escape — cancel
+                text = ""
+                break
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                text = text[:-1]
+            elif 32 <= ch < 127:
+                text += chr(ch)
+        curses.curs_set(0)
+        self.stdscr.nodelay(True)
+        self._update_timeout()
+        return text.strip()
 
     # --- viewport ---
 
@@ -368,10 +615,18 @@ class App:
         grid_rows = max(1, max_h - 3)
         grid_cols = max(1, max_w // 2)
 
+        if self.blueprint_mode:
+            self._draw_blueprint(max_h, max_w, grid_rows, grid_cols)
+        else:
+            self._draw_normal(max_h, max_w, grid_rows, grid_cols)
+
+        self.stdscr.refresh()
+
+    def _draw_normal(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
         # Build ghost preview set for pattern
         ghost: set[tuple[int, int]] = set()
         if self.pattern_idx is not None:
-            pat = PATTERNS[PATTERN_NAMES[self.pattern_idx]]
+            pat = self.all_patterns[self.all_pattern_names[self.pattern_idx]]
             for dr, dc in pat:
                 ghost.add((self.cursor_r + dr, self.cursor_c + dc))
 
@@ -442,18 +697,100 @@ class App:
         # Help bar
         help_y = max_h - 1
         if help_y > 0:
-            pat_name = PATTERN_NAMES[self.pattern_idx] if self.pattern_idx is not None else "None"
+            pat_name = self.all_pattern_names[self.pattern_idx] if self.pattern_idx is not None else "None"
+            custom_count = len(self.all_pattern_names) - len(PATTERNS)
+            custom_tag = f" (+{custom_count} custom)" if custom_count > 0 else ""
             help_text = (
                 f" [Space]Run [S]tep [R]and [C]lear [Q]uit | "
-                f"[P/N]Pattern: {pat_name} [Enter]Place [Esc]Desel | "
-                f"[+/-]Speed [T]orus [</>]Rewind/FF [W]Save [O]Load"
+                f"[P/N]Pattern: {pat_name}{custom_tag} [Enter]Place [Esc]Desel | "
+                f"[B]lueprint [X]Del [+/-]Spd [T]orus [</>]Rew [W]Save [O]Load"
             )
             try:
                 self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
             except curses.error:
                 pass
 
-        self.stdscr.refresh()
+    def _draw_blueprint(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the blueprint editing canvas."""
+        # Compute selection bounds
+        sel_r1 = sel_r2 = sel_c1 = sel_c2 = -1
+        if self.sel_corner1 is not None and self.sel_corner2 is not None:
+            sel_r1 = min(self.sel_corner1[0], self.sel_corner2[0])
+            sel_r2 = max(self.sel_corner1[0], self.sel_corner2[0])
+            sel_c1 = min(self.sel_corner1[1], self.sel_corner2[1])
+            sel_c2 = max(self.sel_corner1[1], self.sel_corner2[1])
+
+        for screen_r in range(min(grid_rows, self.grid.height)):
+            r = screen_r + self.view_r
+            if r >= self.grid.height:
+                break
+            for screen_c in range(min(grid_cols, self.grid.width)):
+                c = screen_c + self.view_c
+                if c >= self.grid.width:
+                    break
+                x = screen_c * 2
+                if x + 1 >= max_w:
+                    break
+
+                is_drawn = (r, c) in self.blueprint_cells
+                is_cursor = (r == self.cursor_r and c == self.cursor_c)
+                in_sel = sel_r1 <= r <= sel_r2 and sel_c1 <= c <= sel_c2
+
+                if is_cursor:
+                    attr = curses.A_REVERSE
+                    if self.use_color:
+                        attr |= curses.color_pair(2)
+                    ch = "██" if is_drawn else "▒▒"
+                elif is_drawn:
+                    if in_sel:
+                        attr = curses.color_pair(1) | curses.A_BOLD if self.use_color else curses.A_BOLD
+                    else:
+                        attr = curses.color_pair(4) if self.use_color else curses.A_BOLD
+                    ch = "██"
+                elif in_sel:
+                    attr = curses.color_pair(3) if self.use_color else curses.A_DIM
+                    ch = "░░"
+                else:
+                    attr = 0
+                    ch = "  "
+
+                try:
+                    self.stdscr.addstr(screen_r, x, ch, attr)
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            sel_info = ""
+            if self.sel_corner1 is not None and self.sel_corner2 is None:
+                sel_info = f" | Sel: ({self.sel_corner1[0]},{self.sel_corner1[1]})->..."
+            elif self.sel_corner1 is not None and self.sel_corner2 is not None:
+                sel_info = f" | Sel: ({sel_r1},{sel_c1})-({sel_r2},{sel_c2})"
+            status = (
+                f" BLUEPRINT MODE | Cells drawn: {len(self.blueprint_cells)} | "
+                f"Cursor: ({self.cursor_r},{self.cursor_c}){sel_info} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(7) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Enter]Toggle cell [M]ark corner [A]Select all [C]lear canvas "
+                "[B]Save pattern [Esc]Cancel"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
 
     # --- history ---
 
