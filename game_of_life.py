@@ -5086,6 +5086,47 @@ class App:
         self.dla_world: DLAWorld | None = None
         self.dla_gen = 0
         self.dla_preset_idx = 0
+        # Mode picker menu state
+        self.menu_mode = False
+        self.menu_cursor = 0        # flat index into visible items
+        self.menu_scroll = 0        # scroll offset for long lists
+        # Menu catalog: (category, label, description, start_method_name)
+        self.MENU_MODES: list[tuple[str, str, str, str]] = [
+            # --- Cellular Automata ---
+            ("Cellular Automata", "Conway's Game of Life", "Classic 2-state cellular automaton", "_menu_start_life"),
+            ("Cellular Automata", "Wolfram 1D (W)", "Elementary 1D cellular automata (256 rules)", "_start_wolfram"),
+            ("Cellular Automata", "Lenia (L)", "Continuous cellular automaton with smooth kernels", "_start_lenia"),
+            ("Cellular Automata", "Multi-State (X)", "Brian's Brain / Wireworld / Langton's Ant", "_start_multistate"),
+            ("Cellular Automata", "Neural CA (N)", "Neural cellular automata with learned update rules", "_start_nca"),
+            ("Cellular Automata", "Abelian Sandpile (J)", "Self-organized criticality on a grid", "_start_sandpile"),
+            # --- Physics ---
+            ("Physics", "Falling Sand (F)", "Particle-based sandbox with multiple materials", "_start_sand"),
+            ("Physics", "Reaction-Diffusion (R)", "Gray-Scott reaction-diffusion patterns", "_start_rd"),
+            ("Physics", "Fluid Dynamics (D)", "Lattice Boltzmann fluid simulation", "_start_fluid"),
+            ("Physics", "Ising Model (I)", "Statistical mechanics spin lattice", "_start_ising"),
+            ("Physics", "Magnetic Field (G)", "Electromagnetic particle simulation", "_start_magfield"),
+            ("Physics", "N-Body Gravity (K)", "Gravitational N-body simulation", "_start_nbody"),
+            ("Physics", "Hydraulic Erosion (Y)", "Terrain erosion by water flow", "_start_erosion"),
+            ("Physics", "DLA (L)", "Diffusion-limited aggregation crystal growth", "_start_dla"),
+            # --- Biology ---
+            ("Biology", "Particle Life (P)", "Emergent life-like behavior from simple attraction rules", "_start_pl"),
+            ("Biology", "Wa-Tor Ecosystem (E)", "Predator-prey population dynamics", "_start_eco"),
+            ("Biology", "Physarum Slime (S)", "Slime mold agent-based network formation", "_start_physarum"),
+            ("Biology", "Boids Flocking (B)", "Reynolds flocking with separation/alignment/cohesion", "_start_boids"),
+            ("Biology", "Forest Fire (F)", "Stochastic forest fire cellular automaton", "_start_forestfire"),
+            # --- Procedural ---
+            ("Procedural", "Wave Function Collapse (T)", "Constraint-based procedural terrain generation", "_start_wfc"),
+            ("Procedural", "Turmites (U)", "2D Turing machines on a grid", "_start_turmite"),
+        ]
+        # Precompute category boundaries for menu rendering
+        self._menu_categories: list[str] = []
+        self._menu_cat_indices: list[int] = []  # flat index where each category starts
+        seen: set[str] = set()
+        for i, (cat, _, _, _) in enumerate(self.MENU_MODES):
+            if cat not in seen:
+                seen.add(cat)
+                self._menu_categories.append(cat)
+                self._menu_cat_indices.append(i)
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -5372,6 +5413,10 @@ class App:
         key = self.stdscr.getch()
         if key == -1:
             return True
+
+        # Mode picker menu has its own input handler
+        if self.menu_mode:
+            return self._handle_menu_input(key)
 
         # Blueprint mode has its own input handler
         if self.blueprint_mode:
@@ -5727,6 +5772,10 @@ class App:
             self._set_message(
                 f"Evolve goal: {PatternEvolver.FITNESS_LABELS[criteria[idx]]}"
             )
+
+        # Mode picker menu
+        elif key in (ord("?"), ord("/")):
+            self._open_menu()
 
         # Brush size with [z/Z] keys: z shrink, Z grow (shift+z)
         elif key == ord("z"):
@@ -10177,7 +10226,9 @@ class App:
         grid_rows = max(1, max_h - 3)
         grid_cols = max(1, max_w // 2)
 
-        if self.lenia_mode:
+        if self.menu_mode:
+            self._draw_menu(max_h, max_w)
+        elif self.lenia_mode:
             self._draw_lenia(max_h, max_w, grid_rows, grid_cols)
         elif self.wolfram_mode:
             self._draw_wolfram(max_h, max_w, grid_rows, grid_cols)
@@ -10992,6 +11043,215 @@ class App:
 
     def _update_timeout(self) -> None:
         self.stdscr.timeout(1000 // self.speed)
+
+    # ---- Mode Picker Menu ----
+
+    def _menu_start_life(self) -> None:
+        """Return to Conway's Game of Life (no-op if already there)."""
+        self._set_message("Conway's Game of Life")
+
+    def _open_menu(self) -> None:
+        """Open the mode picker menu."""
+        self.menu_mode = True
+        self.menu_cursor = 0
+        self.menu_scroll = 0
+
+    def _close_menu(self) -> None:
+        """Close the mode picker menu without launching anything."""
+        self.menu_mode = False
+
+    def _handle_menu_input(self, key: int) -> bool:
+        """Handle input while mode picker menu is open."""
+        num_items = len(self.MENU_MODES)
+
+        if key == ord("q"):
+            return False
+
+        # Close menu
+        if key in (27, ord("?"), ord("/")):  # Escape or toggle keys
+            self._close_menu()
+
+        # Navigate up
+        elif key in (curses.KEY_UP, ord("k")):
+            self.menu_cursor = (self.menu_cursor - 1) % num_items
+
+        # Navigate down
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.menu_cursor = (self.menu_cursor + 1) % num_items
+
+        # Jump to previous category
+        elif key in (curses.KEY_LEFT, ord("h")):
+            # Find the category of the current item
+            cur_cat = self.MENU_MODES[self.menu_cursor][0]
+            # Find the start of the previous category
+            prev_start = 0
+            for i, cat in enumerate(self._menu_categories):
+                if cat == cur_cat:
+                    if i > 0:
+                        prev_start = self._menu_cat_indices[i - 1]
+                    else:
+                        prev_start = self._menu_cat_indices[-1]
+                    break
+            self.menu_cursor = prev_start
+
+        # Jump to next category
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            cur_cat = self.MENU_MODES[self.menu_cursor][0]
+            next_start = 0
+            for i, cat in enumerate(self._menu_categories):
+                if cat == cur_cat:
+                    if i < len(self._menu_categories) - 1:
+                        next_start = self._menu_cat_indices[i + 1]
+                    else:
+                        next_start = self._menu_cat_indices[0]
+                    break
+            self.menu_cursor = next_start
+
+        # Page up / Page down
+        elif key == curses.KEY_PPAGE:
+            self.menu_cursor = max(0, self.menu_cursor - 10)
+        elif key == curses.KEY_NPAGE:
+            self.menu_cursor = min(num_items - 1, self.menu_cursor + 10)
+
+        # Home / End
+        elif key == curses.KEY_HOME:
+            self.menu_cursor = 0
+        elif key == curses.KEY_END:
+            self.menu_cursor = num_items - 1
+
+        # Launch selected mode
+        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+            _, label, _, method_name = self.MENU_MODES[self.menu_cursor]
+            self._close_menu()
+            method = getattr(self, method_name)
+            method()
+
+        elif key == curses.KEY_RESIZE:
+            pass
+
+        return True
+
+    def _draw_menu(self, max_h: int, max_w: int) -> None:
+        """Draw the full-screen mode picker menu."""
+        # Title
+        title = " Simulation Mode Picker "
+        subtitle = " Use arrows to navigate, Enter to launch, ? or Esc to close "
+        hint = " h/l or Left/Right: jump between categories "
+
+        # Center title
+        col = max(0, (max_w - len(title)) // 2)
+        try:
+            if self.use_color:
+                self.stdscr.addstr(0, col, title, curses.color_pair(9) | curses.A_BOLD)
+            else:
+                self.stdscr.addstr(0, col, title, curses.A_BOLD | curses.A_REVERSE)
+        except curses.error:
+            pass
+
+        # Subtitle
+        sub_col = max(0, (max_w - len(subtitle)) // 2)
+        try:
+            self.stdscr.addstr(1, sub_col, subtitle, curses.A_DIM)
+        except curses.error:
+            pass
+
+        # Available rows for items (reserve top 3 lines and bottom 2)
+        top_margin = 3
+        bottom_margin = 2
+        visible_rows = max(1, max_h - top_margin - bottom_margin)
+
+        # Adjust scroll to keep cursor visible
+        if self.menu_cursor < self.menu_scroll:
+            self.menu_scroll = self.menu_cursor
+        # Account for category headers when computing visible extent
+        # Simple approach: scroll so cursor item is visible
+        if self.menu_cursor >= self.menu_scroll + visible_rows:
+            self.menu_scroll = self.menu_cursor - visible_rows + 1
+        self.menu_scroll = max(0, self.menu_scroll)
+
+        # Compute display lines: category headers + items
+        # We build a flat list of display lines with their types
+        display_lines: list[tuple[str, str, int]] = []  # (type, text, mode_idx)
+        last_cat = ""
+        for idx, (cat, label, desc, _) in enumerate(self.MENU_MODES):
+            if cat != last_cat:
+                if last_cat:
+                    display_lines.append(("blank", "", -1))
+                display_lines.append(("header", cat, -1))
+                last_cat = cat
+            display_lines.append(("item", f"  {label:<32s} {desc}", idx))
+
+        # Find which display line corresponds to the cursor
+        cursor_display_idx = 0
+        for di, (dtype, _, midx) in enumerate(display_lines):
+            if dtype == "item" and midx == self.menu_cursor:
+                cursor_display_idx = di
+                break
+
+        # Adjust scroll based on display lines
+        if cursor_display_idx < self.menu_scroll:
+            self.menu_scroll = cursor_display_idx
+        if cursor_display_idx >= self.menu_scroll + visible_rows:
+            self.menu_scroll = cursor_display_idx - visible_rows + 1
+        self.menu_scroll = max(0, min(self.menu_scroll, max(0, len(display_lines) - visible_rows)))
+
+        # Category color mapping
+        cat_colors = {
+            "Cellular Automata": 11,  # cyan
+            "Physics": 10,            # green
+            "Biology": 9,             # yellow
+            "Procedural": 12,         # magenta
+        }
+
+        # Render visible lines
+        row = top_margin
+        for di in range(self.menu_scroll, min(len(display_lines), self.menu_scroll + visible_rows)):
+            if row >= max_h - bottom_margin:
+                break
+            dtype, text, midx = display_lines[di]
+            if dtype == "blank":
+                row += 1
+                continue
+            elif dtype == "header":
+                # Category header
+                header_text = f" {text} "
+                cat_col = cat_colors.get(text, 8)
+                try:
+                    if self.use_color:
+                        self.stdscr.addstr(row, 1, header_text,
+                                           curses.color_pair(cat_col) | curses.A_BOLD)
+                    else:
+                        self.stdscr.addstr(row, 1, header_text, curses.A_BOLD | curses.A_UNDERLINE)
+                except curses.error:
+                    pass
+            elif dtype == "item":
+                is_selected = (midx == self.menu_cursor)
+                display_text = text[:max_w - 4]
+                try:
+                    if is_selected:
+                        marker = " > "
+                        if self.use_color:
+                            self.stdscr.addstr(row, 0, marker, curses.color_pair(9) | curses.A_BOLD)
+                            self.stdscr.addstr(row, 3, display_text, curses.A_REVERSE | curses.A_BOLD)
+                        else:
+                            self.stdscr.addstr(row, 0, marker, curses.A_BOLD)
+                            self.stdscr.addstr(row, 3, display_text, curses.A_REVERSE | curses.A_BOLD)
+                    else:
+                        try:
+                            self.stdscr.addstr(row, 3, display_text)
+                        except curses.error:
+                            pass
+                except curses.error:
+                    pass
+            row += 1
+
+        # Bottom hint bar
+        try:
+            hint_text = hint[:max_w - 1]
+            self.stdscr.addstr(max_h - 1, max(0, (max_w - len(hint_text)) // 2),
+                               hint_text, curses.A_DIM)
+        except curses.error:
+            pass
 
     def _set_message(self, msg: str) -> None:
         self.message = msg
