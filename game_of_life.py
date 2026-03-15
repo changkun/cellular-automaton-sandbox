@@ -3330,6 +3330,280 @@ class ErosionWorld:
 
 
 # ---------------------------------------------------------------------------
+# Magnetic Field / Electromagnetic Particle Simulation
+# ---------------------------------------------------------------------------
+
+MAGFIELD_PRESETS = {
+    "cyclotron": {
+        "desc": "Circular orbits in uniform B-field",
+        "B": (0.0, 0.0, 1.0),       # B-field (Bx, By, Bz) — z-component curves in XY plane
+        "E": (0.0, 0.0, 0.0),       # E-field (Ex, Ey, Ez)
+        "num_particles": 30,
+        "charge_ratio": 0.5,         # fraction of positive charges
+        "speed_range": (0.3, 1.5),
+        "spawn": "center-burst",
+    },
+    "magnetic-bottle": {
+        "desc": "Converging B-field traps particles",
+        "B": (0.0, 0.0, 0.8),
+        "E": (0.0, 0.0, 0.0),
+        "num_particles": 40,
+        "charge_ratio": 0.5,
+        "speed_range": (0.5, 2.0),
+        "spawn": "line-horizontal",
+        "mirror": True,
+    },
+    "exb-drift": {
+        "desc": "E x B drift — particles drift perpendicular to E and B",
+        "B": (0.0, 0.0, 1.2),
+        "E": (0.0, 0.3, 0.0),
+        "num_particles": 25,
+        "charge_ratio": 0.5,
+        "speed_range": (0.2, 1.0),
+        "spawn": "left-column",
+    },
+    "hall-effect": {
+        "desc": "Charge separation in crossed E and B fields",
+        "B": (0.0, 0.0, 0.6),
+        "E": (0.4, 0.0, 0.0),
+        "num_particles": 50,
+        "charge_ratio": 0.5,
+        "speed_range": (0.1, 0.8),
+        "spawn": "uniform",
+    },
+    "aurora": {
+        "desc": "Particles spiralling along converging field lines",
+        "B": (0.0, 0.0, 1.5),
+        "E": (0.0, 0.0, 0.0),
+        "num_particles": 60,
+        "charge_ratio": 0.6,
+        "speed_range": (0.5, 2.5),
+        "spawn": "top-scatter",
+        "mirror": True,
+    },
+}
+
+MAGFIELD_PRESET_NAMES = list(MAGFIELD_PRESETS.keys())
+
+
+class MagFieldWorld:
+    """Electromagnetic particle simulation under Lorentz force.
+
+    Charged particles move through configurable B and E fields.
+    F = q(v x B) + qE  (Lorentz force, integrated with velocity-Verlet).
+    """
+
+    def __init__(self, width: int, height: int, preset: str = "cyclotron"):
+        self.width = width
+        self.height = height
+        self.preset_idx = MAGFIELD_PRESET_NAMES.index(preset)
+        self.steps_per_tick = 1
+        self.dt = 0.15  # integration timestep
+        self.trail_len = 8  # number of trail positions to remember
+
+        # Particles: list of dicts with keys x, y, vx, vy, charge, trail
+        self.particles: list[dict] = []
+        # Field parameters
+        self.Bx = 0.0
+        self.By = 0.0
+        self.Bz = 1.0
+        self.Ex = 0.0
+        self.Ey = 0.0
+        self.Ez = 0.0
+        self.mirror_mode = False  # magnetic bottle mirror effect
+
+        self._apply_preset(preset)
+
+    def _apply_preset(self, name: str) -> None:
+        p = MAGFIELD_PRESETS[name]
+        self.Bx, self.By, self.Bz = p["B"]
+        self.Ex, self.Ey, self.Ez = p["E"]
+        self.mirror_mode = p.get("mirror", False)
+        self._spawn_particles(
+            p["num_particles"],
+            p["charge_ratio"],
+            p["speed_range"],
+            p["spawn"],
+        )
+
+    def _spawn_particles(
+        self,
+        n: int,
+        charge_ratio: float,
+        speed_range: tuple[float, float],
+        spawn: str,
+    ) -> None:
+        """Create initial particles."""
+        self.particles = []
+        w, h = self.width, self.height
+        cx, cy = w / 2.0, h / 2.0
+        slo, shi = speed_range
+
+        for i in range(n):
+            q = 1.0 if random.random() < charge_ratio else -1.0
+            speed = random.uniform(slo, shi)
+            angle = random.uniform(0, 2 * math.pi)
+            vx = speed * math.cos(angle)
+            vy = speed * math.sin(angle)
+
+            if spawn == "center-burst":
+                x = cx + random.uniform(-3, 3)
+                y = cy + random.uniform(-3, 3)
+            elif spawn == "line-horizontal":
+                x = random.uniform(w * 0.2, w * 0.8)
+                y = cy + random.uniform(-1, 1)
+            elif spawn == "left-column":
+                x = w * 0.1 + random.uniform(-2, 2)
+                y = random.uniform(h * 0.2, h * 0.8)
+                vx = abs(vx)  # start moving right
+            elif spawn == "top-scatter":
+                x = random.uniform(w * 0.1, w * 0.9)
+                y = h * 0.1 + random.uniform(-2, 2)
+                vy = abs(vy)  # start moving downward
+            else:  # uniform
+                x = random.uniform(1, w - 2)
+                y = random.uniform(1, h - 2)
+
+            self.particles.append({
+                "x": x, "y": y,
+                "vx": vx, "vy": vy,
+                "q": q,
+                "trail": [],
+            })
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(MAGFIELD_PRESET_NAMES)
+        name = MAGFIELD_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def reset(self) -> None:
+        """Reset to initial state for current preset."""
+        name = MAGFIELD_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+
+    def tick(self) -> None:
+        for _ in range(self.steps_per_tick):
+            self._step()
+
+    def _effective_B(self, x: float, y: float) -> tuple[float, float, float]:
+        """Return the B-field at position (x, y).
+
+        In mirror mode, Bz increases near top/bottom edges to simulate
+        a magnetic bottle (converging field lines).
+        """
+        bx, by, bz = self.Bx, self.By, self.Bz
+        if self.mirror_mode:
+            # Strengthen B near top/bottom to create mirror effect
+            norm_y = y / self.height
+            mirror_factor = 1.0 + 3.0 * (2.0 * norm_y - 1.0) ** 4
+            bz *= mirror_factor
+            # Add radial component for convergence
+            norm_x = (x / self.width - 0.5) * 2.0
+            bx += 0.3 * norm_x * ((2.0 * norm_y - 1.0) ** 2)
+        return bx, by, bz
+
+    def _step(self) -> None:
+        """Boris integrator for Lorentz force: F = q(v x B + E)."""
+        dt = self.dt
+        w, h = self.width, self.height
+
+        for p in self.particles:
+            q = p["q"]
+            x, y = p["x"], p["y"]
+            vx, vy = p["vx"], p["vy"]
+
+            # Get local B-field
+            bx, by, bz = self._effective_B(x, y)
+
+            # Boris push (half-step E, rotate via B, half-step E)
+            # Half acceleration from E
+            half_dt_q = 0.5 * dt * q
+            vx += half_dt_q * self.Ex
+            vy += half_dt_q * self.Ey
+
+            # Rotation from B using Boris method
+            # t = q*B*dt/2
+            tx = half_dt_q * bx
+            ty = half_dt_q * by
+            tz = half_dt_q * bz
+
+            # v' = v + v x t
+            vpx = vx + (vy * tz - 0.0 * ty)  # vz=0 for 2D
+            vpy = vy + (0.0 * tx - vx * tz)
+
+            # s = 2t / (1 + |t|^2)
+            t_mag2 = tx * tx + ty * ty + tz * tz
+            s_factor = 2.0 / (1.0 + t_mag2)
+            sx = s_factor * tx
+            sy = s_factor * ty
+            sz = s_factor * tz
+
+            # v = v + v' x s
+            vx += (vpy * sz - 0.0 * sy)
+            vy += (0.0 * sx - vpx * sz)
+
+            # Second half acceleration from E
+            vx += half_dt_q * self.Ex
+            vy += half_dt_q * self.Ey
+
+            # Speed cap to keep things visible
+            speed = math.sqrt(vx * vx + vy * vy)
+            max_speed = 4.0
+            if speed > max_speed:
+                vx *= max_speed / speed
+                vy *= max_speed / speed
+
+            # Save trail
+            p["trail"].append((x, y))
+            if len(p["trail"]) > self.trail_len:
+                p["trail"] = p["trail"][-self.trail_len:]
+
+            # Update position
+            nx = x + vx * dt
+            ny = y + vy * dt
+
+            # Boundary: reflect
+            if nx < 0:
+                nx = -nx
+                vx = -vx
+            elif nx >= w:
+                nx = 2 * w - nx - 1
+                vx = -vx
+            if ny < 0:
+                ny = -ny
+                vy = -vy
+            elif ny >= h:
+                ny = 2 * h - ny - 1
+                vy = -vy
+
+            # Clamp to bounds
+            nx = max(0.0, min(w - 0.01, nx))
+            ny = max(0.0, min(h - 0.01, ny))
+
+            p["x"] = nx
+            p["y"] = ny
+            p["vx"] = vx
+            p["vy"] = vy
+
+    @property
+    def stats(self) -> dict:
+        """Return simulation statistics."""
+        if not self.particles:
+            return {"n": 0, "pos": 0, "neg": 0, "avg_speed": 0.0, "max_speed": 0.0}
+        pos = sum(1 for p in self.particles if p["q"] > 0)
+        neg = len(self.particles) - pos
+        speeds = [math.sqrt(p["vx"] ** 2 + p["vy"] ** 2) for p in self.particles]
+        return {
+            "n": len(self.particles),
+            "pos": pos,
+            "neg": neg,
+            "avg_speed": sum(speeds) / len(speeds),
+            "max_speed": max(speeds),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Pattern detector — identifies known still lifes, oscillators, spaceships
 # ---------------------------------------------------------------------------
 
@@ -3911,6 +4185,11 @@ class App:
         self.erosion_world: ErosionWorld | None = None
         self.erosion_gen = 0
         self.erosion_preset_idx = 0
+        # Magnetic Field simulation mode
+        self.magfield_mode = False
+        self.magfield_world: MagFieldWorld | None = None
+        self.magfield_gen = 0
+        self.magfield_preset_idx = 0
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -3972,6 +4251,9 @@ class App:
             elif self.erosion_mode:
                 if self.running:
                     self._erosion_tick()
+            elif self.magfield_mode:
+                if self.running:
+                    self._magfield_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -4107,6 +4389,13 @@ class App:
             curses.init_pair(104, curses.COLOR_RED, -1)     # Erosion: high terrain
             curses.init_pair(105, curses.COLOR_WHITE, -1)   # Erosion: peak/snow
             curses.init_pair(106, curses.COLOR_MAGENTA, -1) # Erosion: sediment
+            # Magnetic Field mode color pairs
+            curses.init_pair(110, curses.COLOR_RED, -1)      # MagField: positive trail
+            curses.init_pair(111, curses.COLOR_BLUE, -1)     # MagField: negative trail
+            curses.init_pair(112, curses.COLOR_RED, -1)      # MagField: fast positive
+            curses.init_pair(113, curses.COLOR_YELLOW, -1)   # MagField: slow positive
+            curses.init_pair(114, curses.COLOR_CYAN, -1)     # MagField: fast negative
+            curses.init_pair(115, curses.COLOR_BLUE, -1)     # MagField: slow negative
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -4209,6 +4498,10 @@ class App:
         # Erosion mode has its own input handler
         if self.erosion_mode:
             return self._handle_erosion_input(key)
+
+        # Magnetic Field mode has its own input handler
+        if self.magfield_mode:
+            return self._handle_magfield_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -4437,6 +4730,10 @@ class App:
         # Hydraulic Erosion mode
         elif key == ord("Y"):
             self._start_erosion()
+
+        # Magnetic Field simulation mode
+        elif key == ord("G"):
+            self._start_magfield()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -7433,6 +7730,278 @@ class App:
             except curses.error:
                 pass
 
+    # --- Magnetic Field simulation ---
+
+    def _handle_magfield_input(self, key: int) -> bool:
+        """Handle input while in Magnetic Field mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            if not self.running:
+                self._magfield_tick()
+        elif key == ord("r"):
+            if self.magfield_world:
+                self.magfield_world.reset()
+                self.magfield_gen = 0
+                self._set_message("Reset")
+        # Cycle preset forward/back
+        elif key == ord("p") or key == ord("n"):
+            if self.magfield_world:
+                direction = 1 if key == ord("n") else -1
+                name = self.magfield_world.cycle_preset(direction)
+                self.magfield_preset_idx = self.magfield_world.preset_idx
+                self.magfield_gen = 0
+                self._set_message(f"Preset: {name}")
+        # Steps per tick
+        elif key == ord("]"):
+            if self.magfield_world:
+                self.magfield_world.steps_per_tick = min(50, self.magfield_world.steps_per_tick * 2)
+                self._set_message(f"Steps/tick: {self.magfield_world.steps_per_tick}")
+        elif key == ord("["):
+            if self.magfield_world:
+                self.magfield_world.steps_per_tick = max(1, self.magfield_world.steps_per_tick // 2)
+                self._set_message(f"Steps/tick: {self.magfield_world.steps_per_tick}")
+        # Adjust B-field strength
+        elif key == ord("+") or key == ord("="):
+            if self.magfield_world:
+                mw = self.magfield_world
+                scale = 1.25
+                mw.Bx *= scale
+                mw.By *= scale
+                mw.Bz *= scale
+                self._set_message(f"B-field: ({mw.Bx:.2f}, {mw.By:.2f}, {mw.Bz:.2f})")
+        elif key == ord("-") or key == ord("_"):
+            if self.magfield_world:
+                mw = self.magfield_world
+                scale = 0.8
+                mw.Bx *= scale
+                mw.By *= scale
+                mw.Bz *= scale
+                self._set_message(f"B-field: ({mw.Bx:.2f}, {mw.By:.2f}, {mw.Bz:.2f})")
+        # Adjust E-field
+        elif key == ord("e"):
+            if self.magfield_world:
+                mw = self.magfield_world
+                # Cycle through E-field directions
+                if abs(mw.Ex) > 0.01:
+                    mw.Ex = 0.0
+                    mw.Ey = abs(mw.Ex) + 0.3 if abs(mw.Ex) < 0.01 else mw.Ex
+                    mw.Ey = 0.3
+                elif abs(mw.Ey) > 0.01:
+                    mw.Ey = 0.0
+                else:
+                    mw.Ex = 0.3
+                self._set_message(f"E-field: ({mw.Ex:.2f}, {mw.Ey:.2f})")
+        # Add more particles
+        elif key == ord("a"):
+            if self.magfield_world:
+                mw = self.magfield_world
+                preset = MAGFIELD_PRESETS[MAGFIELD_PRESET_NAMES[mw.preset_idx]]
+                q = 1.0 if random.random() < 0.5 else -1.0
+                speed = random.uniform(*preset["speed_range"])
+                angle = random.uniform(0, 2 * math.pi)
+                mw.particles.append({
+                    "x": mw.width / 2.0 + random.uniform(-3, 3),
+                    "y": mw.height / 2.0 + random.uniform(-3, 3),
+                    "vx": speed * math.cos(angle),
+                    "vy": speed * math.sin(angle),
+                    "q": q,
+                    "trail": [],
+                })
+                self._set_message(f"Added particle (n={len(mw.particles)})")
+        # Toggle trail length
+        elif key == ord("t"):
+            if self.magfield_world:
+                mw = self.magfield_world
+                mw.trail_len = (mw.trail_len + 4) % 24
+                if mw.trail_len == 0:
+                    mw.trail_len = 4
+                self._set_message(f"Trail length: {mw.trail_len}")
+        # Speed control
+        elif key == ord("f"):
+            self.speed = min(20, self.speed + 1)
+            self._update_timeout()
+        elif key == ord("d"):
+            self.speed = max(1, self.speed - 1)
+            self._update_timeout()
+        # Exit Magnetic Field mode
+        elif key == ord("G") or key == 27:
+            self._stop_magfield()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_magfield(self) -> None:
+        """Enter Magnetic Field mode."""
+        self.running = False
+        self.magfield_mode = True
+        self.magfield_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(4, max_w // 2)
+        h = max(4, max_h - 3)
+        preset = MAGFIELD_PRESET_NAMES[self.magfield_preset_idx]
+        self.magfield_world = MagFieldWorld(w, h, preset=preset)
+        self._set_message(
+            "MagField — [Space]Run [P/N]Preset [+/-]B-field [Shift+G]Exit"
+        )
+
+    def _stop_magfield(self) -> None:
+        """Exit Magnetic Field mode."""
+        self.magfield_mode = False
+        self.running = False
+        self.magfield_world = None
+        self.magfield_gen = 0
+        self._set_message("Magnetic Field mode ended")
+
+    def _magfield_tick(self) -> None:
+        """Advance one magnetic field simulation step."""
+        if self.magfield_world:
+            self.magfield_world.tick()
+            self.magfield_gen += 1
+
+    def _draw_magfield(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the magnetic field particle simulation."""
+        if not self.magfield_world:
+            return
+        mw = self.magfield_world
+
+        # Build a grid for rendering: each cell can hold trail or particle info
+        # We use 2-char wide cells like other modes
+        draw_w = min(grid_cols, mw.width)
+        draw_h = min(grid_rows, mw.height)
+
+        # Collect trail positions into a grid for efficient rendering
+        trail_grid: dict[tuple[int, int], tuple[float, float]] = {}  # (r,c) -> (charge, age_fraction)
+        particle_grid: dict[tuple[int, int], dict] = {}  # (r,c) -> particle
+
+        for p in mw.particles:
+            # Draw trail
+            trail = p["trail"]
+            for ti, (tx, ty) in enumerate(trail):
+                tr = int(ty)
+                tc = int(tx)
+                if 0 <= tr < draw_h and 0 <= tc < draw_w:
+                    age = (ti + 1) / max(len(trail), 1)
+                    trail_grid[(tr, tc)] = (p["q"], age)
+
+            # Draw particle at current position
+            pr = int(p["y"])
+            pc = int(p["x"])
+            if 0 <= pr < draw_h and 0 <= pc < draw_w:
+                particle_grid[(pr, pc)] = p
+
+        # Render trails first, then particles on top
+        for (r, c), (charge, age) in trail_grid.items():
+            if (r, c) in particle_grid:
+                continue  # particle will overwrite
+            sc = c * 2
+            if sc + 1 >= max_w:
+                continue
+
+            # Trail chars: dim dots fading with age
+            trail_chars = ["··", "∙∙", "░░", "▒▒"]
+            ci = min(int(age * len(trail_chars)), len(trail_chars) - 1)
+            ch = trail_chars[ci]
+
+            if self.use_color:
+                if charge > 0:
+                    cp = curses.color_pair(110)  # red trail for positive
+                else:
+                    cp = curses.color_pair(111)  # blue trail for negative
+                attr = cp | curses.A_DIM
+            else:
+                attr = curses.A_DIM
+
+            try:
+                self.stdscr.addstr(r, sc, ch, attr)
+            except curses.error:
+                pass
+
+        # Render particles
+        for (r, c), p in particle_grid.items():
+            sc = c * 2
+            if sc + 1 >= max_w:
+                continue
+
+            speed = math.sqrt(p["vx"] ** 2 + p["vy"] ** 2)
+
+            # Direction-based character
+            if abs(p["vx"]) > abs(p["vy"]):
+                ch = "»»" if p["vx"] > 0 else "««"
+            else:
+                ch = "▼▼" if p["vy"] > 0 else "▲▲"
+
+            if self.use_color:
+                # Color by charge and speed
+                if p["q"] > 0:
+                    if speed > 2.0:
+                        cp = curses.color_pair(112)  # bright red (fast positive)
+                    else:
+                        cp = curses.color_pair(113)  # yellow (slow positive)
+                else:
+                    if speed > 2.0:
+                        cp = curses.color_pair(114)  # bright cyan (fast negative)
+                    else:
+                        cp = curses.color_pair(115)  # blue (slow negative)
+                attr = cp | curses.A_BOLD
+            else:
+                attr = curses.A_BOLD if p["q"] > 0 else curses.A_NORMAL
+
+            try:
+                self.stdscr.addstr(r, sc, ch, attr)
+            except curses.error:
+                pass
+
+        # Draw field direction indicator in top-right corner
+        if draw_h > 2 and max_w > 20:
+            field_info = f"B=({mw.Bx:.1f},{mw.By:.1f},{mw.Bz:.1f})"
+            if abs(mw.Ex) > 0.01 or abs(mw.Ey) > 0.01:
+                field_info += f" E=({mw.Ex:.1f},{mw.Ey:.1f})"
+            fi_x = max(0, max_w - len(field_info) - 2)
+            attr = curses.color_pair(3) | curses.A_DIM if self.use_color else curses.A_DIM
+            try:
+                self.stdscr.addstr(0, fi_x, field_info, attr)
+            except curses.error:
+                pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            preset_name = MAGFIELD_PRESET_NAMES[mw.preset_idx]
+            state_str = "RUNNING" if self.running else "PAUSED"
+            st = mw.stats
+            total_steps = self.magfield_gen * mw.steps_per_tick
+            status = (
+                f" MagField | Gen: {self.magfield_gen} ({total_steps} steps) | "
+                f"Particles: {st['n']} (+{st['pos']}/-{st['neg']}) | "
+                f"Avg spd: {st['avg_speed']:.2f} | "
+                f"Preset: {preset_name} | Speed: {self.speed} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset | "
+                "[P/N]Preset [+/-]B-field [E]toggle E | "
+                "[A]dd particle [T]rail | "
+                "[F]aster [D]slower | [Shift+G]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -7784,6 +8353,8 @@ class App:
             self._draw_turmite(max_h, max_w, grid_rows, grid_cols)
         elif self.erosion_mode:
             self._draw_erosion(max_h, max_w, grid_rows, grid_cols)
+        elif self.magfield_mode:
+            self._draw_magfield(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
