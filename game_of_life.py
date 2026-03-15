@@ -3836,6 +3836,238 @@ class NBodyWorld:
 
 
 # ---------------------------------------------------------------------------
+# Forest Fire simulation — percolation dynamics & self-organized criticality
+# ---------------------------------------------------------------------------
+
+FIRE_EMPTY = 0
+FIRE_TREE = 1
+FIRE_BURNING = 2
+FIRE_CHARRED = 3
+
+FORESTFIRE_PRESETS = {
+    "classic": {
+        "desc": "Classic forest fire — balanced growth and lightning",
+        "p_grow": 0.05,
+        "p_lightning": 0.0001,
+        "charred_cooldown": 3,
+        "init": "random",
+        "init_density": 0.55,
+    },
+    "dense-forest": {
+        "desc": "Dense canopy — rare lightning, massive cascading burns",
+        "p_grow": 0.08,
+        "p_lightning": 0.00003,
+        "charred_cooldown": 5,
+        "init": "random",
+        "init_density": 0.75,
+    },
+    "sparse-dry": {
+        "desc": "Sparse dry landscape — frequent small fires",
+        "p_grow": 0.02,
+        "p_lightning": 0.001,
+        "charred_cooldown": 2,
+        "init": "random",
+        "init_density": 0.3,
+    },
+    "percolation-threshold": {
+        "desc": "Near p_c ≈ 0.5927 — critical percolation cluster emergence",
+        "p_grow": 0.03,
+        "p_lightning": 0.0002,
+        "charred_cooldown": 4,
+        "init": "random",
+        "init_density": 0.59,
+    },
+    "regrowth": {
+        "desc": "Fast regrowth cycle — watch the forest recover",
+        "p_grow": 0.12,
+        "p_lightning": 0.0005,
+        "charred_cooldown": 1,
+        "init": "random",
+        "init_density": 0.5,
+    },
+    "inferno": {
+        "desc": "Full forest, single lightning strike — watch it all burn",
+        "p_grow": 0.0,
+        "p_lightning": 0.0,
+        "charred_cooldown": 4,
+        "init": "full",
+        "init_density": 1.0,
+    },
+}
+FORESTFIRE_PRESET_NAMES = list(FORESTFIRE_PRESETS.keys())
+
+
+class ForestFireWorld:
+    """Forest Fire cellular automaton — self-organized criticality via percolation."""
+
+    def __init__(self, width: int, height: int, preset: str = "classic"):
+        self.width = width
+        self.height = height
+        self.preset_idx = FORESTFIRE_PRESET_NAMES.index(preset)
+        self.p_grow = 0.05
+        self.p_lightning = 0.0001
+        self.charred_cooldown = 3
+        self.steps_per_tick = 1
+        # Grid: 0=empty, 1=tree, 2=burning, 3=charred
+        self.grid = [[FIRE_EMPTY] * width for _ in range(height)]
+        # Cooldown counter for charred cells
+        self.cooldown = [[0] * width for _ in range(height)]
+        self.tree_count = 0
+        self.burning_count = 0
+        self.total_burned = 0
+        self.fire_sizes: list[int] = []  # recent fire cascade sizes
+        self.max_fire_history = 200
+        self.current_fire_size = 0
+        self._apply_preset(preset)
+
+    def _apply_preset(self, name: str) -> None:
+        import random as _rng
+        cfg = FORESTFIRE_PRESETS[name]
+        self.p_grow = cfg["p_grow"]
+        self.p_lightning = cfg["p_lightning"]
+        self.charred_cooldown = cfg["charred_cooldown"]
+        self.grid = [[FIRE_EMPTY] * self.width for _ in range(self.height)]
+        self.cooldown = [[0] * self.width for _ in range(self.height)]
+        self.tree_count = 0
+        self.burning_count = 0
+        self.total_burned = 0
+        self.fire_sizes = []
+        self.current_fire_size = 0
+        if cfg["init"] == "random":
+            density = cfg["init_density"]
+            for r in range(self.height):
+                for c in range(self.width):
+                    if _rng.random() < density:
+                        self.grid[r][c] = FIRE_TREE
+                        self.tree_count += 1
+        elif cfg["init"] == "full":
+            for r in range(self.height):
+                for c in range(self.width):
+                    self.grid[r][c] = FIRE_TREE
+                    self.tree_count += 1
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(FORESTFIRE_PRESET_NAMES)
+        name = FORESTFIRE_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def reset(self) -> None:
+        self._apply_preset(FORESTFIRE_PRESET_NAMES[self.preset_idx])
+
+    def strike_at(self, r: int, c: int) -> None:
+        """Manually ignite a tree at (r, c)."""
+        if 0 <= r < self.height and 0 <= c < self.width:
+            if self.grid[r][c] == FIRE_TREE:
+                self.grid[r][c] = FIRE_BURNING
+                self.tree_count -= 1
+                self.burning_count += 1
+
+    def tick(self) -> None:
+        import random as _rng
+        for _ in range(self.steps_per_tick):
+            self._step(_rng)
+
+    def _step(self, _rng) -> None:
+        w, h = self.width, self.height
+        new_grid = [row[:] for row in self.grid]
+        new_cooldown = [row[:] for row in self.cooldown]
+        new_burning = 0
+        new_trees = 0
+        fires_this_step = 0
+
+        for r in range(h):
+            grow = self.grid[r]
+            for c in range(w):
+                cell = grow[c]
+                if cell == FIRE_BURNING:
+                    # Burning → charred
+                    new_grid[r][c] = FIRE_CHARRED
+                    new_cooldown[r][c] = self.charred_cooldown
+                    self.total_burned += 1
+                    fires_this_step += 1
+                elif cell == FIRE_TREE:
+                    # Check if any von Neumann neighbor is burning
+                    ignited = False
+                    if r > 0 and self.grid[r - 1][c] == FIRE_BURNING:
+                        ignited = True
+                    elif r < h - 1 and self.grid[r + 1][c] == FIRE_BURNING:
+                        ignited = True
+                    elif c > 0 and self.grid[r][c - 1] == FIRE_BURNING:
+                        ignited = True
+                    elif c < w - 1 and self.grid[r][c + 1] == FIRE_BURNING:
+                        ignited = True
+                    if ignited:
+                        new_grid[r][c] = FIRE_BURNING
+                        new_burning += 1
+                    elif self.p_lightning > 0 and _rng.random() < self.p_lightning:
+                        # Lightning strike
+                        new_grid[r][c] = FIRE_BURNING
+                        new_burning += 1
+                    else:
+                        new_trees += 1
+                elif cell == FIRE_CHARRED:
+                    if new_cooldown[r][c] > 0:
+                        new_cooldown[r][c] -= 1
+                    else:
+                        new_grid[r][c] = FIRE_EMPTY
+                elif cell == FIRE_EMPTY:
+                    if self.p_grow > 0 and _rng.random() < self.p_grow:
+                        new_grid[r][c] = FIRE_TREE
+                        new_trees += 1
+
+        self.grid = new_grid
+        self.cooldown = new_cooldown
+        self.tree_count = new_trees + new_burning  # burning were trees
+        self.burning_count = new_burning
+        self.current_fire_size = fires_this_step
+        if fires_this_step > 0:
+            self.fire_sizes.append(fires_this_step)
+            if len(self.fire_sizes) > self.max_fire_history:
+                self.fire_sizes.pop(0)
+
+    @property
+    def stats(self) -> dict:
+        total_cells = self.width * self.height
+        tree_ct = 0
+        burn_ct = 0
+        char_ct = 0
+        for row in self.grid:
+            for v in row:
+                if v == FIRE_TREE:
+                    tree_ct += 1
+                elif v == FIRE_BURNING:
+                    burn_ct += 1
+                elif v == FIRE_CHARRED:
+                    char_ct += 1
+        density = tree_ct / max(total_cells, 1)
+        avg_fire = 0.0
+        if self.fire_sizes:
+            avg_fire = sum(self.fire_sizes) / len(self.fire_sizes)
+        return {
+            "trees": tree_ct,
+            "burning": burn_ct,
+            "charred": char_ct,
+            "density": density,
+            "total_burned": self.total_burned,
+            "current_fire": self.current_fire_size,
+            "avg_fire": avg_fire,
+            "max_fire": max(self.fire_sizes) if self.fire_sizes else 0,
+        }
+
+    def sparkline(self, width: int = 30) -> str:
+        """Return a unicode sparkline of recent fire sizes."""
+        if not self.fire_sizes:
+            return ""
+        data = self.fire_sizes[-width:]
+        mx = max(data) if data else 1
+        if mx == 0:
+            mx = 1
+        bars = "▁▂▃▄▅▆▇█"
+        return "".join(bars[min(int(v / mx * (len(bars) - 1)), len(bars) - 1)] for v in data)
+
+
+# ---------------------------------------------------------------------------
 # Abelian Sandpile simulation
 # ---------------------------------------------------------------------------
 
@@ -4633,6 +4865,11 @@ class App:
         self.sandpile_world: SandpileWorld | None = None
         self.sandpile_gen = 0
         self.sandpile_preset_idx = 0
+        # Forest Fire mode
+        self.forestfire_mode = False
+        self.forestfire_world: ForestFireWorld | None = None
+        self.forestfire_gen = 0
+        self.forestfire_preset_idx = 0
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -4703,6 +4940,9 @@ class App:
             elif self.sandpile_mode:
                 if self.running:
                     self._sandpile_tick()
+            elif self.forestfire_mode:
+                if self.running:
+                    self._forestfire_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -4861,6 +5101,13 @@ class App:
             curses.init_pair(134, curses.COLOR_RED, -1)      # Sandpile: toppling (>=threshold)
             curses.init_pair(135, curses.COLOR_MAGENTA, -1)  # Sandpile: high pile
             curses.init_pair(136, curses.COLOR_WHITE, -1)    # Sandpile: very high
+            # Forest Fire mode color pairs
+            curses.init_pair(140, curses.COLOR_GREEN, -1)    # ForestFire: tree
+            curses.init_pair(141, curses.COLOR_RED, -1)      # ForestFire: burning
+            curses.init_pair(142, curses.COLOR_YELLOW, -1)   # ForestFire: burning bright
+            curses.init_pair(143, curses.COLOR_WHITE, -1)    # ForestFire: charred (hot)
+            curses.init_pair(144, curses.COLOR_BLACK, -1)    # ForestFire: charred (cool)
+            curses.init_pair(145, curses.COLOR_GREEN, curses.COLOR_GREEN)  # ForestFire: dense tree
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -4975,6 +5222,10 @@ class App:
         # Abelian Sandpile mode has its own input handler
         if self.sandpile_mode:
             return self._handle_sandpile_input(key)
+
+        # Forest Fire mode has its own input handler
+        if self.forestfire_mode:
+            return self._handle_forestfire_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -5215,6 +5466,10 @@ class App:
         # Abelian Sandpile simulation mode
         elif key == ord("J"):
             self._start_sandpile()
+
+        # Forest Fire simulation mode
+        elif key == ord("F"):
+            self._start_forestfire()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -8973,6 +9228,207 @@ class App:
             except curses.error:
                 pass
 
+    # --- Forest Fire mode ---
+
+    def _handle_forestfire_input(self, key: int) -> bool:
+        """Handle input while in Forest Fire mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            self._forestfire_tick()
+        elif key == ord("r"):
+            if self.forestfire_world:
+                self.forestfire_world.reset()
+                self.forestfire_gen = 0
+                self._set_message("Forest fire reset")
+        elif key == ord("p"):
+            if self.forestfire_world:
+                name = self.forestfire_world.cycle_preset(-1)
+                self.forestfire_preset_idx = self.forestfire_world.preset_idx
+                self.forestfire_gen = 0
+                self._set_message(f"Preset: {name}")
+        elif key == ord("n"):
+            if self.forestfire_world:
+                name = self.forestfire_world.cycle_preset(1)
+                self.forestfire_preset_idx = self.forestfire_world.preset_idx
+                self.forestfire_gen = 0
+                self._set_message(f"Preset: {name}")
+        elif key == ord("f"):
+            if self.forestfire_world:
+                self.forestfire_world.steps_per_tick = min(
+                    20, self.forestfire_world.steps_per_tick + 1
+                )
+                self._set_message(f"Steps/tick: {self.forestfire_world.steps_per_tick}")
+        elif key == ord("d"):
+            if self.forestfire_world:
+                self.forestfire_world.steps_per_tick = max(
+                    1, self.forestfire_world.steps_per_tick - 1
+                )
+                self._set_message(f"Steps/tick: {self.forestfire_world.steps_per_tick}")
+        elif key == ord("g"):
+            # Increase growth probability
+            if self.forestfire_world:
+                self.forestfire_world.p_grow = min(1.0, self.forestfire_world.p_grow + 0.01)
+                self._set_message(f"Growth: {self.forestfire_world.p_grow:.3f}")
+        elif key == ord("l"):
+            # Increase lightning probability
+            if self.forestfire_world:
+                self.forestfire_world.p_lightning = min(
+                    0.1, self.forestfire_world.p_lightning * 2 if self.forestfire_world.p_lightning > 0 else 0.00005
+                )
+                self._set_message(f"Lightning: {self.forestfire_world.p_lightning:.5f}")
+        elif key == ord("L"):
+            # Decrease lightning probability
+            if self.forestfire_world:
+                self.forestfire_world.p_lightning = max(0.0, self.forestfire_world.p_lightning / 2)
+                self._set_message(f"Lightning: {self.forestfire_world.p_lightning:.5f}")
+        elif key == ord("G"):
+            # Decrease growth probability
+            if self.forestfire_world:
+                self.forestfire_world.p_grow = max(0.0, self.forestfire_world.p_grow - 0.01)
+                self._set_message(f"Growth: {self.forestfire_world.p_grow:.3f}")
+        elif key == ord("F") or key == 27:  # Shift+F or ESC to exit
+            self._stop_forestfire()
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if self.forestfire_world and bstate & curses.BUTTON1_CLICKED:
+                    gc = mx // 2
+                    gr = my
+                    self.forestfire_world.strike_at(gr, gc)
+            except curses.error:
+                pass
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_forestfire(self) -> None:
+        """Enter Forest Fire simulation mode."""
+        self.running = False
+        self.forestfire_mode = True
+        self.forestfire_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(4, max_w // 2)
+        h = max(4, max_h - 3)
+        preset = FORESTFIRE_PRESET_NAMES[self.forestfire_preset_idx]
+        self.forestfire_world = ForestFireWorld(w, h, preset=preset)
+        try:
+            curses.mousemask(curses.BUTTON1_CLICKED)
+        except curses.error:
+            pass
+        self._set_message(
+            "Forest Fire — [Space]Run [P/N]Preset [Click]Ignite [Shift+F]Exit"
+        )
+
+    def _stop_forestfire(self) -> None:
+        """Exit Forest Fire simulation mode."""
+        self.forestfire_mode = False
+        self.running = False
+        self.forestfire_world = None
+        self.forestfire_gen = 0
+        self._set_message("Forest fire mode ended")
+
+    def _forestfire_tick(self) -> None:
+        """Advance one forest fire simulation step."""
+        if self.forestfire_world:
+            self.forestfire_world.tick()
+            self.forestfire_gen += 1
+
+    def _draw_forestfire(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the Forest Fire simulation."""
+        if not self.forestfire_world:
+            return
+        fw = self.forestfire_world
+
+        draw_h = min(grid_rows, fw.height)
+        draw_w = min(grid_cols, fw.width)
+
+        for r in range(draw_h):
+            row = fw.grid[r]
+            cool_row = fw.cooldown[r]
+            for c in range(draw_w):
+                sc = c * 2
+                if sc + 1 >= max_w:
+                    break
+
+                cell = row[c]
+                if cell == FIRE_EMPTY:
+                    continue
+
+                if cell == FIRE_TREE:
+                    ch = "██"
+                    if self.use_color:
+                        attr = curses.color_pair(140)
+                    else:
+                        attr = curses.A_NORMAL
+                elif cell == FIRE_BURNING:
+                    ch = "▓▓"
+                    if self.use_color:
+                        attr = curses.color_pair(142) | curses.A_BOLD
+                    else:
+                        attr = curses.A_BOLD | curses.A_REVERSE
+                elif cell == FIRE_CHARRED:
+                    remaining = cool_row[c]
+                    if remaining > fw.charred_cooldown // 2:
+                        ch = "░░"
+                        if self.use_color:
+                            attr = curses.color_pair(143)
+                        else:
+                            attr = curses.A_DIM
+                    else:
+                        ch = "░░"
+                        if self.use_color:
+                            attr = curses.color_pair(144)
+                        else:
+                            attr = curses.A_DIM
+                else:
+                    continue
+
+                try:
+                    self.stdscr.addstr(r, sc, ch, attr)
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            preset_name = FORESTFIRE_PRESET_NAMES[fw.preset_idx]
+            state_str = "RUNNING" if self.running else "PAUSED"
+            st = fw.stats
+            sparkline = fw.sparkline(min(30, max(5, max_w // 6)))
+            status = (
+                f" Forest Fire | Gen: {self.forestfire_gen} | "
+                f"Trees: {st['trees']} ({st['density']:.1%}) | "
+                f"Burning: {st['burning']} | Charred: {st['charred']} | "
+                f"Fire: {st['current_fire']} (avg:{st['avg_fire']:.0f} max:{st['max_fire']}) | "
+                f"{sparkline} | "
+                f"Preset: {preset_name} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset | "
+                "[P/N]Preset [F]aster [D]slower | "
+                "[g/G]Growth± [l/L]Lightning± | "
+                "[Click]Ignite | [Shift+F]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -9330,6 +9786,8 @@ class App:
             self._draw_nbody(max_h, max_w, grid_rows, grid_cols)
         elif self.sandpile_mode:
             self._draw_sandpile(max_h, max_w, grid_rows, grid_cols)
+        elif self.forestfire_mode:
+            self._draw_forestfire(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
