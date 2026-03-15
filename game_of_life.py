@@ -166,6 +166,7 @@ class Grid:
 
 class App:
     HISTORY_MAX = 500  # max generations to keep in history
+    SPARKLINE_WIDTH = 40  # number of generations shown in sparkline
 
     def __init__(self, stdscr, width: int, height: int, filepath: str = "save.json"):
         self.stdscr = stdscr
@@ -185,6 +186,8 @@ class App:
         # History timeline: list of (generation, frozenset of cells, ages dict)
         self.history: list[tuple[int, frozenset[tuple[int, int]], dict[tuple[int, int], int]]] = []
         self.history_pos: int = -1  # -1 means live (not rewound)
+        # Population history for sparkline
+        self.pop_history: list[int] = []
 
     # --- main loop ---
 
@@ -199,6 +202,7 @@ class App:
                 break
             if self.running and self.history_pos == -1:
                 self._record_history()
+                self._record_population()
                 self.grid.tick()
                 self.generation += 1
             self._update_viewport()
@@ -265,6 +269,7 @@ class App:
         elif key == ord("s"):
             if not self.running and self.history_pos == -1:
                 self._record_history()
+                self._record_population()
                 self.grid.tick()
                 self.generation += 1
 
@@ -274,6 +279,7 @@ class App:
             self.generation = 0
             self.history.clear()
             self.history_pos = -1
+            self.pop_history.clear()
             self._set_message("Randomized")
 
         # Clear
@@ -282,6 +288,7 @@ class App:
             self.generation = 0
             self.history.clear()
             self.history_pos = -1
+            self.pop_history.clear()
             self._set_message("Cleared")
 
         # Place cell or pattern
@@ -417,8 +424,10 @@ class App:
             hist_info = f"Hist: {len(self.history)}"
             if self.history_pos != -1:
                 hist_info += f" @{self.history_pos}"
+            sparkline = self._sparkline()
+            spark_section = f" |{sparkline}|" if sparkline else ""
             status = (
-                f" Gen: {self.generation} | Cells: {len(self.grid.cells)} | "
+                f" Gen: {self.generation} | Cells: {len(self.grid.cells)}{spark_section} | "
                 f"Speed: {self.speed} | {topo} | {hist_info} | {state} "
             )
             if self.message_ttl > 0:
@@ -530,6 +539,24 @@ class App:
     def _set_message(self, msg: str) -> None:
         self.message = msg
         self.message_ttl = self.speed * 2  # show for ~2 seconds
+
+    def _record_population(self) -> None:
+        """Record current population count for sparkline."""
+        self.pop_history.append(len(self.grid.cells))
+        if len(self.pop_history) > self.SPARKLINE_WIDTH:
+            self.pop_history = self.pop_history[-self.SPARKLINE_WIDTH:]
+
+    def _sparkline(self) -> str:
+        """Return a Unicode sparkline string from population history."""
+        if not self.pop_history:
+            return ""
+        bars = "▁▂▃▄▅▆▇█"
+        values = self.pop_history[-self.SPARKLINE_WIDTH:]
+        lo = min(values)
+        hi = max(values)
+        if hi == lo:
+            return bars[3] * len(values)
+        return "".join(bars[round((v - lo) / (hi - lo) * 7)] for v in values)
 
 
 # ---------------------------------------------------------------------------
