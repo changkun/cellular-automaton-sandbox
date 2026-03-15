@@ -72,7 +72,7 @@ every simulation.
 | Magnetic Field | `Shift+G` | Electromagnetic particle simulation |
 | N-Body Gravity | `Shift+K` | Gravitational N-body simulation |
 | Hydraulic Erosion | `Shift+Y` | Terrain erosion by water flow |
-| DLA | `Shift+L` | Diffusion-limited aggregation crystal growth |
+| DLA | `Shift+Q` | Diffusion-limited aggregation crystal growth |
 | Double Pendulum | `Shift+O` | Chaotic double pendulum with divergence visualization |
 
 ### Biology
@@ -83,7 +83,7 @@ every simulation.
 | Wa-Tor Ecosystem | `Shift+E` | Predator-prey population dynamics |
 | Physarum Slime | `Shift+S` | Slime mold agent-based network formation |
 | Boids Flocking | `Shift+B` | Reynolds flocking with separation, alignment, and cohesion |
-| Forest Fire | `Shift+F` | Stochastic forest fire cellular automaton |
+| Forest Fire | `Shift+C` | Stochastic forest fire cellular automaton |
 | Epidemic SIR | `Shift+H` | Disease spread with susceptible/infected/recovered agents |
 
 ### Procedural Generation
@@ -115,24 +115,31 @@ These controls apply in the default Conway's Game of Life mode:
 |-----|--------|
 | `Space` | Start/pause simulation |
 | `Enter` | Toggle cell under cursor |
-| Arrow keys | Move cursor |
+| Arrow keys / `h` `j` `k` `l` | Move cursor |
+| `s` | Single step (while paused) |
 | `+` / `-` | Adjust simulation speed |
-| `P` / `N` | Cycle through pattern library |
-| `R` | Randomize grid |
-| `C` | Clear grid |
-| `T` | Toggle toroidal wrapping |
+| `p` / `n` | Cycle through pattern library |
+| `r` | Randomize grid |
+| `c` | Clear grid |
+| `t` | Toggle toroidal wrapping |
 | `<` / `>` | Rewind / fast-forward history |
-| `V` | Toggle brush painting mode |
-| `[` / `]` | Adjust brush size |
-| `H` | Toggle heatmap visualization |
-| `D` | Toggle pattern detection dashboard |
-| `A` | Toggle genetic algorithm evolver |
-| `M` | Toggle split-screen comparison mode |
-| `G` / `F` | Cycle rule presets |
+| `v` | Toggle brush painting mode |
+| `e` | Cycle brush shape (square/diamond/circle) |
+| `z` | Shrink brush size |
+| `~` | Toggle heatmap visualization |
+| `d` | Toggle pattern detection dashboard |
+| `a` | Toggle genetic algorithm evolver |
+| `1` `2` `3` | Switch evolver fitness (longevity/population/symmetry) |
+| `m` | Toggle split-screen comparison mode |
+| `f` / `g` | Cycle rule presets |
+| `b` | Enter blueprint mode (create/save custom patterns) |
+| `x` | Delete custom pattern |
 | `Shift+L` | Import RLE pattern file |
 | `w` | Save state |
-| `O` | Load state |
-| `Q` | Quit |
+| `o` | Load state |
+| `?` / `/` | Open mode picker menu |
+| `!` | Start demo tour (auto-cycle all modes) |
+| `q` | Quit |
 
 ## How It Was Built
 
