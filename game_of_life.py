@@ -83,6 +83,7 @@ class Grid:
         self.width = width
         self.height = height
         self.cells: set[tuple[int, int]] = set()
+        self.ages: dict[tuple[int, int], int] = {}  # cell -> generations alive
         self.toroidal = False
 
     def tick(self) -> None:
@@ -101,47 +102,61 @@ class Grid:
                         continue
                     neighbor_count[(nr, nc)] += 1
         new_cells = set()
+        new_ages: dict[tuple[int, int], int] = {}
         for pos, count in neighbor_count.items():
             if count == 3 or (count == 2 and pos in self.cells):
                 new_cells.add(pos)
+                new_ages[pos] = self.ages.get(pos, 0) + 1
         self.cells = new_cells
+        self.ages = new_ages
 
     def toggle_cell(self, r: int, c: int) -> None:
         pos = (r, c)
         if pos in self.cells:
             self.cells.discard(pos)
+            self.ages.pop(pos, None)
         else:
             self.cells.add(pos)
+            self.ages[pos] = 1
 
     def clear(self) -> None:
         self.cells.clear()
+        self.ages.clear()
 
     def randomize(self, density: float = 0.3) -> None:
         self.cells.clear()
+        self.ages.clear()
         for r in range(self.height):
             for c in range(self.width):
                 if random.random() < density:
                     self.cells.add((r, c))
+                    self.ages[(r, c)] = 1
 
     def place_pattern(self, pattern: list[tuple[int, int]], origin_r: int, origin_c: int) -> None:
         for dr, dc in pattern:
             r, c = origin_r + dr, origin_c + dc
             if 0 <= r < self.height and 0 <= c < self.width:
                 self.cells.add((r, c))
+                self.ages[(r, c)] = 1
 
     def to_dict(self, generation: int = 0) -> dict:
         return {
-            "version": 1,
+            "version": 2,
             "width": self.width,
             "height": self.height,
             "generation": generation,
             "cells": sorted(self.cells),
+            "ages": {f"{r},{c}": age for (r, c), age in self.ages.items()},
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> tuple["Grid", int]:
         g = cls(data["width"], data["height"])
         g.cells = {tuple(c) for c in data["cells"]}
+        if "ages" in data:
+            g.ages = {tuple(int(x) for x in k.split(",")): v for k, v in data["ages"].items()}
+        else:
+            g.ages = {pos: 1 for pos in g.cells}
         return g, data.get("generation", 0)
 
 
@@ -167,8 +182,8 @@ class App:
         # Viewport offset for scrolling
         self.view_r = 0
         self.view_c = 0
-        # History timeline: list of (generation, frozenset of cells)
-        self.history: list[tuple[int, frozenset[tuple[int, int]]]] = []
+        # History timeline: list of (generation, frozenset of cells, ages dict)
+        self.history: list[tuple[int, frozenset[tuple[int, int]], dict[tuple[int, int], int]]] = []
         self.history_pos: int = -1  # -1 means live (not rewound)
 
     # --- main loop ---
@@ -191,15 +206,34 @@ class App:
 
     # --- colors ---
 
+    # Age thresholds for color tiers
+    AGE_YOUNG = 5
+    AGE_MATURE = 20
+    AGE_ANCIENT = 50
+
     def _init_colors(self) -> None:
         self.use_color = curses.has_colors()
         if self.use_color:
             curses.start_color()
             curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_GREEN, -1)   # alive cells
+            curses.init_pair(1, curses.COLOR_GREEN, -1)   # newborn cells (age 1)
             curses.init_pair(2, curses.COLOR_YELLOW, -1)  # cursor
             curses.init_pair(3, curses.COLOR_CYAN, -1)    # status bar
             curses.init_pair(4, curses.COLOR_MAGENTA, -1) # ghost pattern preview
+            curses.init_pair(5, curses.COLOR_CYAN, -1)    # young cells
+            curses.init_pair(6, curses.COLOR_YELLOW, -1)  # mature cells
+            curses.init_pair(7, curses.COLOR_RED, -1)     # ancient cells
+
+    def _age_color_pair(self, age: int) -> int:
+        """Return curses color pair number based on cell age."""
+        if age < self.AGE_YOUNG:
+            return 1   # green — newborn
+        elif age < self.AGE_MATURE:
+            return 5   # cyan — young
+        elif age < self.AGE_ANCIENT:
+            return 6   # yellow — mature
+        else:
+            return 7   # red — ancient
 
     # --- input ---
 
@@ -357,7 +391,11 @@ class App:
                         attr |= curses.color_pair(2)
                     ch = "██" if is_alive else "▒▒"
                 elif is_alive:
-                    attr = curses.color_pair(1) if self.use_color else curses.A_BOLD
+                    if self.use_color:
+                        age = self.grid.ages.get((r, c), 1)
+                        attr = curses.color_pair(self._age_color_pair(age))
+                    else:
+                        attr = curses.A_BOLD
                     ch = "██"
                 elif is_ghost:
                     attr = curses.color_pair(4) if self.use_color else curses.A_DIM
@@ -416,7 +454,7 @@ class App:
         if self.history_pos != -1:
             self.history = self.history[: self.history_pos + 1]
             self.history_pos = -1
-        self.history.append((self.generation, frozenset(self.grid.cells)))
+        self.history.append((self.generation, frozenset(self.grid.cells), dict(self.grid.ages)))
         if len(self.history) > self.HISTORY_MAX:
             self.history.pop(0)
 
@@ -428,7 +466,7 @@ class App:
         self.running = False
         if self.history_pos == -1:
             # Save current live state first
-            self.history.append((self.generation, frozenset(self.grid.cells)))
+            self.history.append((self.generation, frozenset(self.grid.cells), dict(self.grid.ages)))
             if len(self.history) > self.HISTORY_MAX + 1:
                 self.history.pop(0)
             self.history_pos = len(self.history) - 2
@@ -437,9 +475,10 @@ class App:
         else:
             self._set_message("At oldest recorded generation")
             return
-        gen, cells = self.history[self.history_pos]
+        gen, cells, ages = self.history[self.history_pos]
         self.generation = gen
         self.grid.cells = set(cells)
+        self.grid.ages = dict(ages)
         self._set_message(f"Rewind to gen {gen}")
 
     def _history_forward(self) -> None:
@@ -452,9 +491,10 @@ class App:
             self.history_pos = -1
             self._set_message("Returned to live")
         else:
-            gen, cells = self.history[self.history_pos]
+            gen, cells, ages = self.history[self.history_pos]
             self.generation = gen
             self.grid.cells = set(cells)
+            self.grid.ages = dict(ages)
             if self.history_pos == len(self.history) - 1:
                 self.history_pos = -1
                 self._set_message("Returned to live")
