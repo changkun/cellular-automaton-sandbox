@@ -4681,6 +4681,272 @@ class MazeWorld:
 
 
 # ---------------------------------------------------------------------------
+# First-Person 3D Ray Caster (walks through MazeWorld mazes)
+# ---------------------------------------------------------------------------
+
+RAYCASTER_PRESETS = {
+    "classic": {
+        "desc": "Classic maze — tight corridors",
+        "maze_preset": "classic",
+        "fov": math.pi / 3,
+        "move_speed": 0.12,
+        "rot_speed": 0.08,
+    },
+    "braided": {
+        "desc": "Braided maze — multiple paths",
+        "maze_preset": "braided",
+        "fov": math.pi / 3,
+        "move_speed": 0.12,
+        "rot_speed": 0.08,
+    },
+    "sparse": {
+        "desc": "Sparse maze — open areas",
+        "maze_preset": "sparse",
+        "fov": math.pi / 3,
+        "move_speed": 0.15,
+        "rot_speed": 0.08,
+    },
+    "wide-fov": {
+        "desc": "Wide field of view — fisheye feel",
+        "maze_preset": "classic",
+        "fov": math.pi / 2,
+        "move_speed": 0.12,
+        "rot_speed": 0.08,
+    },
+    "speed-run": {
+        "desc": "Fast movement through dense maze",
+        "maze_preset": "dense",
+        "fov": math.pi / 3,
+        "move_speed": 0.20,
+        "rot_speed": 0.12,
+    },
+}
+RAYCASTER_PRESET_NAMES = list(RAYCASTER_PRESETS.keys())
+
+# Shade characters from far to near (index 0 = farthest / darkest)
+_RC_SHADES = " .·:░▒▓█"
+# Ceiling / floor shades (far → near)
+_RC_CEIL_SHADES = " .·:"
+_RC_FLOOR_SHADES = " .·:░"
+
+
+class RayCasterWorld:
+    """First-person 3D ray-caster that renders a MazeWorld from the inside."""
+
+    def __init__(self, screen_w: int, screen_h: int, preset: str = "classic"):
+        self.screen_w = screen_w  # columns available for 3D view
+        self.screen_h = screen_h  # rows available for 3D view
+        self.preset_idx = RAYCASTER_PRESET_NAMES.index(preset)
+
+        # Player state
+        self.px = 1.5   # x position (column in maze, fractional)
+        self.py = 1.5   # y position (row in maze, fractional)
+        self.pa = 0.0   # angle in radians (0 = east, pi/2 = south)
+
+        # Config from preset
+        self.fov = math.pi / 3
+        self.move_speed = 0.12
+        self.rot_speed = 0.08
+
+        # Minimap toggle
+        self.show_minimap = True
+        # The underlying maze
+        self.maze: MazeWorld | None = None
+
+        # Computed per-frame: wall distances for each screen column
+        self.wall_dists: list[float] = [0.0] * screen_w
+        # Whether the player reached the end
+        self.reached_end = False
+
+        self._apply_preset(preset)
+
+    def _apply_preset(self, name: str) -> None:
+        cfg = RAYCASTER_PRESETS[name]
+        self.fov = cfg["fov"]
+        self.move_speed = cfg["move_speed"]
+        self.rot_speed = cfg["rot_speed"]
+        self._generate_maze(cfg["maze_preset"])
+
+    def _generate_maze(self, maze_preset: str) -> None:
+        """Create a new maze and finish generation immediately."""
+        # Use a reasonably sized maze (odd dimensions)
+        mw = max(21, min(61, self.screen_w // 2))
+        mh = max(21, min(61, self.screen_h))
+        if mw % 2 == 0:
+            mw -= 1
+        if mh % 2 == 0:
+            mh -= 1
+        maze = MazeWorld(mw, mh, preset=maze_preset)
+        # Complete generation instantly
+        while maze.generating:
+            maze._gen_step()
+        if not maze.gen_done:
+            maze.generating = False
+            maze.gen_done = True
+            maze._finalize_generation()
+        self.maze = maze
+        # Place player at start
+        sr, sc = maze.start
+        self.px = sc + 0.5
+        self.py = sr + 0.5
+        self.pa = 0.0
+        self.reached_end = False
+        self.wall_dists = [0.0] * self.screen_w
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(RAYCASTER_PRESET_NAMES)
+        name = RAYCASTER_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def reset(self) -> None:
+        self._apply_preset(RAYCASTER_PRESET_NAMES[self.preset_idx])
+
+    def new_maze(self) -> None:
+        """Generate a brand new maze with the current preset."""
+        cfg = RAYCASTER_PRESETS[RAYCASTER_PRESET_NAMES[self.preset_idx]]
+        self._generate_maze(cfg["maze_preset"])
+
+    def _is_wall(self, r: int, c: int) -> bool:
+        if self.maze is None:
+            return True
+        if r < 0 or r >= self.maze.height or c < 0 or c >= self.maze.width:
+            return True
+        return self.maze.grid[r][c] == MAZE_WALL
+
+    def move_forward(self) -> None:
+        dx = math.cos(self.pa) * self.move_speed
+        dy = math.sin(self.pa) * self.move_speed
+        nx = self.px + dx
+        ny = self.py + dy
+        # Collision with wall margin
+        margin = 0.2
+        if not self._is_wall(int(ny), int(nx + margin * (1 if dx > 0 else -1))):
+            self.px = nx
+        if not self._is_wall(int(ny + margin * (1 if dy > 0 else -1)), int(self.px)):
+            self.py = ny
+        self._check_end()
+
+    def move_backward(self) -> None:
+        dx = math.cos(self.pa) * self.move_speed
+        dy = math.sin(self.pa) * self.move_speed
+        nx = self.px - dx
+        ny = self.py - dy
+        margin = 0.2
+        if not self._is_wall(int(ny), int(nx - margin * (1 if dx > 0 else -1))):
+            self.px = nx
+        if not self._is_wall(int(ny - margin * (1 if dy > 0 else -1)), int(self.px)):
+            self.py = ny
+        self._check_end()
+
+    def strafe_left(self) -> None:
+        dx = math.cos(self.pa - math.pi / 2) * self.move_speed
+        dy = math.sin(self.pa - math.pi / 2) * self.move_speed
+        nx = self.px + dx
+        ny = self.py + dy
+        margin = 0.2
+        if not self._is_wall(int(ny), int(nx + margin * (1 if dx > 0 else -1))):
+            self.px = nx
+        if not self._is_wall(int(ny + margin * (1 if dy > 0 else -1)), int(self.px)):
+            self.py = ny
+        self._check_end()
+
+    def strafe_right(self) -> None:
+        dx = math.cos(self.pa + math.pi / 2) * self.move_speed
+        dy = math.sin(self.pa + math.pi / 2) * self.move_speed
+        nx = self.px + dx
+        ny = self.py + dy
+        margin = 0.2
+        if not self._is_wall(int(ny), int(nx + margin * (1 if dx > 0 else -1))):
+            self.px = nx
+        if not self._is_wall(int(ny + margin * (1 if dy > 0 else -1)), int(self.px)):
+            self.py = ny
+        self._check_end()
+
+    def rotate_left(self) -> None:
+        self.pa -= self.rot_speed
+
+    def rotate_right(self) -> None:
+        self.pa += self.rot_speed
+
+    def _check_end(self) -> None:
+        if self.maze is None:
+            return
+        er, ec = self.maze.end
+        if int(self.py) == er and int(self.px) == ec:
+            self.reached_end = True
+
+    def cast_rays(self) -> None:
+        """Cast one ray per screen column and store wall distances."""
+        if self.maze is None:
+            return
+        half_fov = self.fov / 2
+        for col in range(self.screen_w):
+            # Ray angle: sweep from pa - half_fov to pa + half_fov
+            ray_frac = col / max(1, self.screen_w - 1)
+            ray_angle = self.pa - half_fov + ray_frac * self.fov
+
+            # DDA ray-cast
+            cos_a = math.cos(ray_angle)
+            sin_a = math.sin(ray_angle)
+
+            # Avoid division by zero
+            if abs(cos_a) < 1e-9:
+                cos_a = 1e-9 if cos_a >= 0 else -1e-9
+            if abs(sin_a) < 1e-9:
+                sin_a = 1e-9 if sin_a >= 0 else -1e-9
+
+            # Step sizes
+            dx = abs(1.0 / cos_a)
+            dy = abs(1.0 / sin_a)
+
+            map_x = int(self.px)
+            map_y = int(self.py)
+
+            if cos_a > 0:
+                step_x = 1
+                side_dist_x = (map_x + 1.0 - self.px) * dx
+            else:
+                step_x = -1
+                side_dist_x = (self.px - map_x) * dx
+
+            if sin_a > 0:
+                step_y = 1
+                side_dist_y = (map_y + 1.0 - self.py) * dy
+            else:
+                step_y = -1
+                side_dist_y = (self.py - map_y) * dy
+
+            hit = False
+            side = 0  # 0 = vertical wall (N/S face), 1 = horizontal wall (E/W face)
+            max_depth = 30.0
+            depth = 0.0
+
+            while not hit and depth < max_depth:
+                if side_dist_x < side_dist_y:
+                    side_dist_x += dx
+                    map_x += step_x
+                    side = 0
+                    depth = side_dist_x - dx
+                else:
+                    side_dist_y += dy
+                    map_y += step_y
+                    side = 1
+                    depth = side_dist_y - dy
+
+                if self._is_wall(map_y, map_x):
+                    hit = True
+
+            # Fix fish-eye: multiply by cos of angle offset from center
+            perp_dist = depth * math.cos(ray_angle - self.pa)
+            self.wall_dists[col] = max(0.1, perp_dist) if hit else max_depth
+
+    def tick(self) -> None:
+        """Recompute ray casting each frame."""
+        self.cast_rays()
+
+
+# ---------------------------------------------------------------------------
 # Mandelbrot & Julia Set Fractal Explorer
 # ---------------------------------------------------------------------------
 
@@ -6507,6 +6773,11 @@ class App:
         self.pendulum_world: DoublePendulumWorld | None = None
         self.pendulum_gen = 0
         self.pendulum_preset_idx = 0
+        # Ray Caster (first-person 3D maze) mode
+        self.raycaster_mode = False
+        self.raycaster_world: RayCasterWorld | None = None
+        self.raycaster_gen = 0
+        self.raycaster_preset_idx = 0
         # Demo Tour (screensaver) state
         self.demo_tour_mode = False
         self.demo_tour_idx = 0          # current index into MENU_MODES
@@ -6551,6 +6822,7 @@ class App:
             ("Mathematics", "Fractal Explorer (Z)", "Interactive Mandelbrot & Julia set explorer with zoom/pan", "_start_fractal"),
             ("Mathematics", "Strange Attractors (A)", "Lorenz, Rössler & Hénon chaotic attractor visualization", "_start_attractor"),
             ("Physics", "Double Pendulum (O)", "Chaotic double pendulum with divergence visualization", "_start_pendulum"),
+            ("Algorithms", "3D Ray Caster (V)", "First-person 3D walk through generated mazes", "_start_raycaster"),
         ]
         # Precompute category boundaries for menu rendering
         self._menu_categories: list[str] = []
@@ -6654,6 +6926,8 @@ class App:
                 self._attractor_tick()
             elif self.pendulum_mode:
                 self._pendulum_tick()
+            elif self.raycaster_mode:
+                self._raycaster_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -6871,6 +7145,17 @@ class App:
             curses.init_pair(207, curses.COLOR_WHITE, -1)      # Attractor: electric white
             curses.init_pair(208, curses.COLOR_CYAN, -1)       # Attractor: ice cyan
             curses.init_pair(209, curses.COLOR_BLUE, -1)       # Attractor: ice blue
+            # Ray Caster color pairs (210-219)
+            curses.init_pair(210, curses.COLOR_WHITE, -1)      # RC: wall near (bright)
+            curses.init_pair(211, curses.COLOR_CYAN, -1)       # RC: wall mid
+            curses.init_pair(212, curses.COLOR_BLUE, -1)       # RC: wall far
+            curses.init_pair(213, curses.COLOR_GREEN, -1)      # RC: end marker
+            curses.init_pair(214, curses.COLOR_RED, -1)        # RC: minimap player
+            curses.init_pair(215, curses.COLOR_YELLOW, -1)     # RC: ceiling
+            curses.init_pair(216, curses.COLOR_GREEN, -1)      # RC: floor
+            curses.init_pair(217, curses.COLOR_MAGENTA, -1)    # RC: victory text
+            curses.init_pair(218, curses.COLOR_YELLOW, -1)     # RC: minimap path
+            curses.init_pair(219, curses.COLOR_WHITE, -1)      # RC: minimap wall
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -7017,6 +7302,10 @@ class App:
         # Double Pendulum mode has its own input handler
         if self.pendulum_mode:
             return self._handle_pendulum_input(key)
+
+        # Ray Caster mode has its own input handler
+        if self.raycaster_mode:
+            return self._handle_raycaster_input(key)
 
         # Maze mode has its own input handler
         if self.maze_mode:
@@ -7289,6 +7578,10 @@ class App:
         # Double Pendulum mode
         elif key == ord("O"):
             self._start_pendulum()
+
+        # First-Person 3D Ray Caster mode
+        elif key == ord("V"):
+            self._start_raycaster()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -11873,6 +12166,291 @@ class App:
             except curses.error:
                 pass
 
+    # --- First-Person 3D Ray Caster mode ---
+
+    def _handle_raycaster_input(self, key: int) -> bool:
+        """Handle input while in Ray Caster mode."""
+        if key == ord("q"):
+            return False
+        elif key in (curses.KEY_UP, ord("w")):
+            if self.raycaster_world:
+                self.raycaster_world.move_forward()
+        elif key in (curses.KEY_DOWN, ord("s")):
+            if self.raycaster_world:
+                self.raycaster_world.move_backward()
+        elif key in (curses.KEY_LEFT, ord("a")):
+            if self.raycaster_world:
+                self.raycaster_world.rotate_left()
+        elif key in (curses.KEY_RIGHT, ord("d")):
+            if self.raycaster_world:
+                self.raycaster_world.rotate_right()
+        elif key == ord(","):
+            if self.raycaster_world:
+                self.raycaster_world.strafe_left()
+        elif key == ord("."):
+            if self.raycaster_world:
+                self.raycaster_world.strafe_right()
+        elif key == ord("m"):
+            if self.raycaster_world:
+                self.raycaster_world.show_minimap = not self.raycaster_world.show_minimap
+                self._set_message(f"Minimap: {'ON' if self.raycaster_world.show_minimap else 'OFF'}")
+        elif key == ord("p"):
+            if self.raycaster_world:
+                name = self.raycaster_world.cycle_preset(-1)
+                self.raycaster_preset_idx = self.raycaster_world.preset_idx
+                self._set_message(f"Preset: {name}")
+        elif key == ord("n"):
+            if self.raycaster_world:
+                name = self.raycaster_world.cycle_preset(1)
+                self.raycaster_preset_idx = self.raycaster_world.preset_idx
+                self._set_message(f"Preset: {name}")
+        elif key == ord("g"):
+            if self.raycaster_world:
+                self.raycaster_world.new_maze()
+                self.raycaster_gen = 0
+                self._set_message("New maze generated!")
+        elif key == ord("r"):
+            if self.raycaster_world:
+                self.raycaster_world.reset()
+                self.raycaster_gen = 0
+                self._set_message("Reset")
+        elif key == ord("V") or key == 27:  # Shift+V or ESC to exit
+            self._stop_raycaster()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_raycaster(self) -> None:
+        """Enter First-Person 3D Ray Caster mode."""
+        self.raycaster_mode = True
+        self.raycaster_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(10, max_w // 2)
+        h = max(10, max_h - 3)
+        preset = RAYCASTER_PRESET_NAMES[self.raycaster_preset_idx]
+        self.raycaster_world = RayCasterWorld(w, h, preset=preset)
+        self.running = True
+        self._set_message(
+            "3D Ray Caster — [↑/W]Fwd [↓/S]Back [←/A]Turn [→/D]Turn [,/.]Strafe [M]inimap [G]enerate [P/N]Preset [Shift+V]Exit"
+        )
+
+    def _stop_raycaster(self) -> None:
+        """Exit Ray Caster mode."""
+        self.raycaster_mode = False
+        self.running = False
+        self.raycaster_world = None
+        self.raycaster_gen = 0
+        self._set_message("Ray Caster mode ended")
+
+    def _raycaster_tick(self) -> None:
+        """Advance one ray caster frame."""
+        if self.raycaster_world:
+            self.raycaster_world.tick()
+            self.raycaster_gen += 1
+
+    def _draw_raycaster(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the first-person 3D ray-cast view."""
+        if not self.raycaster_world:
+            return
+        rc = self.raycaster_world
+
+        # Recalculate screen size if terminal was resized
+        if rc.screen_w != grid_cols:
+            rc.screen_w = grid_cols
+            rc.wall_dists = [0.0] * grid_cols
+            rc.cast_rays()
+
+        view_h = grid_rows
+        half_h = view_h / 2.0
+        max_wall_dist = 20.0
+
+        shades = _RC_SHADES
+        n_shades = len(shades)
+        ceil_shades = _RC_CEIL_SHADES
+        floor_shades = _RC_FLOOR_SHADES
+
+        for col in range(min(grid_cols, len(rc.wall_dists))):
+            dist = rc.wall_dists[col]
+            # Calculate wall strip height
+            wall_h = int(view_h / max(0.3, dist)) if dist < max_wall_dist else 0
+            wall_top = max(0, int(half_h - wall_h / 2))
+            wall_bot = min(view_h - 1, int(half_h + wall_h / 2))
+
+            # Shade index for wall (closer = brighter)
+            shade_ratio = 1.0 - min(1.0, dist / max_wall_dist)
+            shade_idx = int(shade_ratio * (n_shades - 1))
+            shade_idx = max(0, min(n_shades - 1, shade_idx))
+            wall_char = shades[shade_idx]
+
+            # Color based on distance
+            if self.use_color:
+                if dist < max_wall_dist * 0.33:
+                    wall_attr = curses.color_pair(210) | curses.A_BOLD
+                elif dist < max_wall_dist * 0.66:
+                    wall_attr = curses.color_pair(211)
+                else:
+                    wall_attr = curses.color_pair(212) | curses.A_DIM
+            else:
+                wall_attr = curses.A_BOLD if shade_ratio > 0.5 else curses.A_DIM
+
+            sc = col * 2  # screen column (double-width)
+            if sc + 1 >= max_w:
+                break
+
+            # Draw ceiling
+            for row in range(wall_top):
+                ceil_ratio = 1.0 - row / max(1, half_h)
+                ci = int(ceil_ratio * (len(ceil_shades) - 1))
+                ci = max(0, min(len(ceil_shades) - 1, ci))
+                ch = ceil_shades[ci]
+                c_attr = curses.color_pair(215) | curses.A_DIM if self.use_color else curses.A_DIM
+                try:
+                    self.stdscr.addstr(row, sc, ch * 2, c_attr)
+                except curses.error:
+                    pass
+
+            # Draw wall strip
+            for row in range(wall_top, wall_bot + 1):
+                try:
+                    self.stdscr.addstr(row, sc, wall_char * 2, wall_attr)
+                except curses.error:
+                    pass
+
+            # Draw floor
+            for row in range(wall_bot + 1, view_h):
+                floor_ratio = (row - half_h) / max(1, half_h)
+                fi = int(floor_ratio * (len(floor_shades) - 1))
+                fi = max(0, min(len(floor_shades) - 1, fi))
+                fch = floor_shades[fi]
+                f_attr = curses.color_pair(216) | curses.A_DIM if self.use_color else curses.A_DIM
+                try:
+                    self.stdscr.addstr(row, sc, fch * 2, f_attr)
+                except curses.error:
+                    pass
+
+        # Draw minimap overlay (top-right corner)
+        if rc.show_minimap and rc.maze is not None:
+            self._draw_raycaster_minimap(rc, grid_cols, max_w, grid_rows)
+
+        # Victory overlay
+        if rc.reached_end:
+            msg = "  YOU REACHED THE EXIT!  Press [G] for new maze  "
+            vy = max(0, view_h // 2 - 1)
+            vx = max(0, (max_w - len(msg)) // 2)
+            attr = curses.color_pair(217) | curses.A_BOLD if self.use_color else curses.A_BOLD | curses.A_REVERSE
+            try:
+                self.stdscr.addstr(vy, vx, msg, attr)
+            except curses.error:
+                pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            preset_name = RAYCASTER_PRESET_NAMES[rc.preset_idx]
+            pos_str = f"({rc.px:.1f},{rc.py:.1f})"
+            angle_deg = int(math.degrees(rc.pa) % 360)
+            maze_size = f"{rc.maze.width}x{rc.maze.height}" if rc.maze else "?"
+            status = (
+                f" 3D Ray Caster | Pos: {pos_str} | "
+                f"Angle: {angle_deg}° | Maze: {maze_size} | "
+                f"FOV: {int(math.degrees(rc.fov))}° | "
+                f"{preset_name} "
+            )
+            if rc.reached_end:
+                status += "| EXIT REACHED! "
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [↑/W]Forward [↓/S]Back [←/A]Left [→/D]Right [,/.]Strafe | "
+                "[M]inimap [G]enerate [R]eset [P/N]Preset | [Shift+V]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
+    def _draw_raycaster_minimap(self, rc: RayCasterWorld, grid_cols: int, max_w: int, grid_rows: int) -> None:
+        """Draw minimap overlay in the top-right corner."""
+        if rc.maze is None:
+            return
+        maze = rc.maze
+        # Minimap dimensions (scaled down)
+        mm_w = min(20, maze.width)
+        mm_h = min(15, maze.height)
+        # Scale factors
+        sx = maze.width / mm_w
+        sy = maze.height / mm_h
+        # Position at top-right
+        start_col = max_w - mm_w - 2
+        start_row = 1
+        if start_col < 0:
+            return
+
+        # Draw border
+        try:
+            self.stdscr.addstr(start_row - 1, start_col - 1, "┌" + "─" * mm_w + "┐", curses.A_DIM)
+        except curses.error:
+            pass
+        for mr in range(mm_h):
+            row_chars = ""
+            for mc in range(mm_w):
+                # Map minimap coords back to maze coords
+                mz_r = int(mr * sy)
+                mz_c = int(mc * sx)
+                mz_r = min(mz_r, maze.height - 1)
+                mz_c = min(mz_c, maze.width - 1)
+                cell = maze.grid[mz_r][mz_c]
+                if cell == MAZE_WALL:
+                    row_chars += "█"
+                elif cell == MAZE_END:
+                    row_chars += "E"
+                elif cell == MAZE_START:
+                    row_chars += "S"
+                else:
+                    row_chars += " "
+            try:
+                self.stdscr.addstr(start_row + mr, start_col - 1, "│", curses.A_DIM)
+                self.stdscr.addstr(start_row + mr, start_col, row_chars,
+                                   curses.color_pair(219) | curses.A_DIM if self.use_color else curses.A_DIM)
+                self.stdscr.addstr(start_row + mr, start_col + mm_w, "│", curses.A_DIM)
+            except curses.error:
+                pass
+        try:
+            self.stdscr.addstr(start_row + mm_h, start_col - 1, "└" + "─" * mm_w + "┘", curses.A_DIM)
+        except curses.error:
+            pass
+
+        # Draw player position on minimap
+        pm_c = int(rc.px / sx)
+        pm_r = int(rc.py / sy)
+        pm_c = max(0, min(mm_w - 1, pm_c))
+        pm_r = max(0, min(mm_h - 1, pm_r))
+        # Direction arrow
+        angle = rc.pa % (2 * math.pi)
+        if angle < math.pi / 4 or angle >= 7 * math.pi / 4:
+            arrow = "→"
+        elif angle < 3 * math.pi / 4:
+            arrow = "↓"
+        elif angle < 5 * math.pi / 4:
+            arrow = "←"
+        else:
+            arrow = "↑"
+        p_attr = curses.color_pair(214) | curses.A_BOLD if self.use_color else curses.A_BOLD
+        try:
+            self.stdscr.addstr(start_row + pm_r, start_col + pm_c, arrow, p_attr)
+        except curses.error:
+            pass
+
     # --- Fractal Explorer mode ---
 
     def _handle_fractal_input(self, key: int) -> bool:
@@ -12891,6 +13469,8 @@ class App:
             self._draw_attractor(max_h, max_w, grid_rows, grid_cols)
         elif self.pendulum_mode:
             self._draw_pendulum(max_h, max_w, grid_rows, grid_cols)
+        elif self.raycaster_mode:
+            self._draw_raycaster(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
@@ -13725,6 +14305,8 @@ class App:
             self._stop_attractor()
         elif self.pendulum_mode:
             self._stop_pendulum()
+        elif self.raycaster_mode:
+            self._stop_raycaster()
         elif self.split_mode:
             self._stop_split()
         elif self.evolve_mode:
