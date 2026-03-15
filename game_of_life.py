@@ -8,6 +8,7 @@ import os
 import random
 import math
 import re
+import time
 from collections import Counter
 from typing import ClassVar
 
@@ -5312,6 +5313,12 @@ class App:
         self.sir_world: SIRWorld | None = None
         self.sir_gen = 0
         self.sir_preset_idx = 0
+        # Demo Tour (screensaver) state
+        self.demo_tour_mode = False
+        self.demo_tour_idx = 0          # current index into MENU_MODES
+        self.demo_tour_start_time = 0.0 # when the current mode started
+        self.demo_tour_duration = 10.0  # seconds per mode
+        self.demo_tour_paused = False
         # Mode picker menu state
         self.menu_mode = False
         self.menu_cursor = 0        # flat index into visible items
@@ -5370,6 +5377,11 @@ class App:
         while True:
             if not self._handle_input():
                 break
+            # Demo tour: auto-advance to next mode when timer expires
+            if self.demo_tour_mode and not self.demo_tour_paused:
+                elapsed = time.monotonic() - self.demo_tour_start_time
+                if elapsed >= self.demo_tour_duration:
+                    self._demo_tour_next()
             if self.lenia_mode:
                 if self.running:
                     self._lenia_tick()
@@ -5650,6 +5662,10 @@ class App:
         key = self.stdscr.getch()
         if key == -1:
             return True
+
+        # Demo tour mode: most keys exit, a few control playback
+        if self.demo_tour_mode:
+            return self._handle_demo_tour_input(key)
 
         # Mode picker menu has its own input handler
         if self.menu_mode:
@@ -6017,6 +6033,10 @@ class App:
             self._set_message(
                 f"Evolve goal: {PatternEvolver.FITNESS_LABELS[criteria[idx]]}"
             )
+
+        # Demo Tour (screensaver) mode
+        elif key == ord("!"):
+            self._start_demo_tour()
 
         # Mode picker menu
         elif key in (ord("?"), ord("/")):
@@ -10742,6 +10762,10 @@ class App:
         else:
             self._draw_normal(max_h, max_w, grid_rows, grid_cols)
 
+        # Demo tour overlay on top of whatever mode is drawing
+        if self.demo_tour_mode:
+            self._draw_demo_tour_overlay(max_h, max_w)
+
         self.stdscr.refresh()
 
     DASHBOARD_WIDTH = 22  # sidebar width in characters
@@ -11511,6 +11535,204 @@ class App:
     def _update_timeout(self) -> None:
         self.stdscr.timeout(1000 // self.speed)
 
+    # ---- Demo Tour (Screensaver) ----
+
+    def _stop_current_mode(self) -> None:
+        """Stop whichever simulation mode is currently active."""
+        if self.lenia_mode:
+            self._stop_lenia()
+        elif self.wolfram_mode:
+            self._stop_wolfram()
+        elif self.multistate_mode:
+            self._stop_multistate()
+        elif self.sand_mode:
+            self._stop_sand()
+        elif self.rd_mode:
+            self._stop_rd()
+        elif self.pl_mode:
+            self._stop_pl()
+        elif self.eco_mode:
+            self._stop_eco()
+        elif self.physarum_mode:
+            self._stop_physarum()
+        elif self.fluid_mode:
+            self._stop_fluid()
+        elif self.ising_mode:
+            self._stop_ising()
+        elif self.boids_mode:
+            self._stop_boids()
+        elif self.nca_mode:
+            self._stop_nca()
+        elif self.wfc_mode:
+            self._stop_wfc()
+        elif self.turmite_mode:
+            self._stop_turmite()
+        elif self.erosion_mode:
+            self._stop_erosion()
+        elif self.magfield_mode:
+            self._stop_magfield()
+        elif self.nbody_mode:
+            self._stop_nbody()
+        elif self.sandpile_mode:
+            self._stop_sandpile()
+        elif self.forestfire_mode:
+            self._stop_forestfire()
+        elif self.dla_mode:
+            self._stop_dla()
+        elif self.sir_mode:
+            self._stop_sir()
+        elif self.split_mode:
+            self._stop_split()
+        elif self.evolve_mode:
+            self._stop_evolve()
+
+    def _start_demo_tour(self) -> None:
+        """Start the demo tour screensaver that cycles through all modes."""
+        self._stop_current_mode()
+        self.demo_tour_mode = True
+        self.demo_tour_idx = 0
+        self.demo_tour_paused = False
+        self._demo_tour_launch_current()
+
+    def _stop_demo_tour(self) -> None:
+        """Exit demo tour and return to Conway's Game of Life."""
+        self._stop_current_mode()
+        self.demo_tour_mode = False
+        self.demo_tour_paused = False
+        self.running = False
+        self._set_message("Demo Tour ended — press ? for mode picker")
+
+    def _demo_tour_launch_current(self) -> None:
+        """Launch the mode at the current demo tour index."""
+        self._stop_current_mode()
+        _, label, _, method_name = self.MENU_MODES[self.demo_tour_idx]
+        method = getattr(self, method_name)
+        method()
+        # Auto-run the simulation
+        self.running = True
+        self.demo_tour_start_time = time.monotonic()
+
+    def _demo_tour_next(self) -> None:
+        """Advance to the next mode in the tour."""
+        self.demo_tour_idx = (self.demo_tour_idx + 1) % len(self.MENU_MODES)
+        self._demo_tour_launch_current()
+
+    def _demo_tour_prev(self) -> None:
+        """Go back to the previous mode in the tour."""
+        self.demo_tour_idx = (self.demo_tour_idx - 1) % len(self.MENU_MODES)
+        self._demo_tour_launch_current()
+
+    def _handle_demo_tour_input(self, key: int) -> bool:
+        """Handle input during demo tour. Most keys exit the tour."""
+        if key == ord("q"):
+            self._stop_demo_tour()
+            return False
+
+        # Navigation within the tour
+        if key in (curses.KEY_RIGHT, ord("n"), ord("l"), ord(" ")):
+            self._demo_tour_next()
+        elif key in (curses.KEY_LEFT, ord("p"), ord("h")):
+            self._demo_tour_prev()
+        # Pause/resume
+        elif key == ord("P") or key == ord("k"):
+            self.demo_tour_paused = not self.demo_tour_paused
+            if not self.demo_tour_paused:
+                # Reset timer so current mode gets a full duration from now
+                self.demo_tour_start_time = time.monotonic()
+        # Adjust duration
+        elif key == ord("+") or key == ord("="):
+            self.demo_tour_duration = min(60.0, self.demo_tour_duration + 2.0)
+        elif key == ord("-") or key == ord("_"):
+            self.demo_tour_duration = max(4.0, self.demo_tour_duration - 2.0)
+        # Resize: ignore
+        elif key == curses.KEY_RESIZE:
+            pass
+        # Any other key: exit demo tour, keep current mode running
+        elif key == 27:  # Escape
+            self._stop_demo_tour()
+        elif key in (ord("\n"), ord("\r")):
+            # Enter: exit tour but stay in current mode
+            self.demo_tour_mode = False
+            self.demo_tour_paused = False
+            cat, label, desc, _ = self.MENU_MODES[self.demo_tour_idx]
+            self._set_message(f"Staying in {label} — tour ended")
+        return True
+
+    def _draw_demo_tour_overlay(self, max_h: int, max_w: int) -> None:
+        """Draw an informational overlay on top of the current mode during demo tour."""
+        if max_h < 5 or max_w < 30:
+            return
+
+        cat, label, desc, _ = self.MENU_MODES[self.demo_tour_idx]
+        idx = self.demo_tour_idx
+        total = len(self.MENU_MODES)
+        elapsed = time.monotonic() - self.demo_tour_start_time
+        remaining = max(0.0, self.demo_tour_duration - elapsed) if not self.demo_tour_paused else self.demo_tour_duration - elapsed
+
+        # Progress bar
+        progress = min(1.0, elapsed / self.demo_tour_duration) if not self.demo_tour_paused else min(1.0, elapsed / self.demo_tour_duration)
+        bar_width = min(30, max_w - 4)
+        filled = int(bar_width * progress)
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        # Build overlay lines
+        mode_num = f"[{idx + 1}/{total}]"
+        title_line = f" ▶ DEMO TOUR  {mode_num} "
+        name_line = f" {label} "
+        cat_line = f" {cat} "
+        desc_line = f" {desc} "
+        timer_line = f" {bar} {remaining:.0f}s " if not self.demo_tour_paused else f" {bar} PAUSED "
+        controls_line = " ←/→:skip  P:pause  +/-:speed  Enter:stay  Esc:exit "
+
+        lines = [title_line, cat_line, name_line, "", desc_line, timer_line, "", controls_line]
+
+        # Calculate box dimensions
+        box_w = max(len(line) for line in lines) + 4
+        box_w = min(box_w, max_w - 2)
+        box_h = len(lines) + 2  # +2 for top/bottom border
+
+        # Position: top-right corner
+        start_r = 1
+        start_c = max(0, max_w - box_w - 2)
+
+        # Draw box background
+        try:
+            # Top border
+            top_border = "╭" + "─" * (box_w - 2) + "╮"
+            self.stdscr.addstr(start_r, start_c, top_border[:max_w - start_c],
+                               curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_BOLD)
+
+            for i, line in enumerate(lines):
+                r = start_r + 1 + i
+                if r >= max_h - 2:
+                    break
+                # Pad line to fill box
+                padded = line.ljust(box_w - 2)[:box_w - 2]
+                content = "│" + padded + "│"
+
+                attr = curses.A_BOLD if self.use_color else curses.A_BOLD
+                if i == 0:  # Title
+                    attr = curses.color_pair(9) | curses.A_BOLD if self.use_color else curses.A_BOLD | curses.A_REVERSE
+                elif i == 2:  # Mode name
+                    attr = curses.color_pair(11) | curses.A_BOLD if self.use_color else curses.A_BOLD
+                elif i == 4:  # Description
+                    attr = curses.color_pair(3) if self.use_color else curses.A_DIM
+                elif i == 5:  # Timer/progress
+                    attr = curses.color_pair(10) | curses.A_BOLD if self.use_color else curses.A_BOLD
+                elif i == 7:  # Controls
+                    attr = curses.A_DIM
+
+                self.stdscr.addstr(r, start_c, content[:max_w - start_c], attr)
+
+            # Bottom border
+            bot_r = start_r + len(lines) + 1
+            if bot_r < max_h - 2:
+                bot_border = "╰" + "─" * (box_w - 2) + "╯"
+                self.stdscr.addstr(bot_r, start_c, bot_border[:max_w - start_c],
+                                   curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_BOLD)
+        except curses.error:
+            pass
+
     # ---- Mode Picker Menu ----
 
     def _menu_start_life(self) -> None:
@@ -11593,6 +11815,11 @@ class App:
             method = getattr(self, method_name)
             method()
 
+        # Launch demo tour from menu
+        elif key == ord("!"):
+            self._close_menu()
+            self._start_demo_tour()
+
         elif key == curses.KEY_RESIZE:
             pass
 
@@ -11603,7 +11830,7 @@ class App:
         # Title
         title = " Simulation Mode Picker "
         subtitle = " Use arrows to navigate, Enter to launch, ? or Esc to close "
-        hint = " h/l or Left/Right: jump between categories "
+        hint = " h/l or Left/Right: jump categories | ! Demo Tour (auto-cycle all modes) "
 
         # Center title
         col = max(0, (max_w - len(title)) // 2)
@@ -11752,6 +11979,8 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=0, help="Grid width (0 = auto-fit terminal)")
     parser.add_argument("--height", type=int, default=0, help="Grid height (0 = auto-fit terminal)")
     parser.add_argument("--file", type=str, default="save.json", help="Save/load file path")
+    parser.add_argument("--demo", action="store_true", help="Start in Demo Tour screensaver mode")
+    parser.add_argument("--demo-duration", type=float, default=10.0, help="Seconds per mode in Demo Tour (default: 10)")
     args = parser.parse_args()
 
     def start(stdscr):
@@ -11759,6 +11988,9 @@ def main() -> None:
         w = args.width if args.width > 0 else max(1, max_w // 2)
         h = args.height if args.height > 0 else max(1, max_h - 3)
         app = App(stdscr, w, h, filepath=args.file)
+        if args.demo:
+            app.demo_tour_duration = args.demo_duration
+            app._start_demo_tour()
         app.run()
 
     curses.wrapper(start)
