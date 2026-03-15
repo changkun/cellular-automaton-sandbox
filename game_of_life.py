@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Terminal-based Conway's Game of Life simulator using curses."""
+"""Terminal-based cellular automaton simulator using curses."""
 
 import argparse
 import curses
@@ -106,6 +106,31 @@ PATTERN_NAMES = list(PATTERNS.keys())
 
 
 # ---------------------------------------------------------------------------
+# Ruleset — birth/survival conditions for outer-totalistic cellular automata
+# ---------------------------------------------------------------------------
+
+RULESETS = [
+    ("Life", {3}, {2, 3}),                          # B3/S23 — Conway's Game of Life
+    ("HighLife", {3, 6}, {2, 3}),                    # B36/S23 — has a replicator
+    ("Day & Night", {3, 6, 7, 8}, {3, 4, 6, 7, 8}), # B3678/S34678
+    ("Seeds", {2}, set()),                           # B2/S — every cell dies each tick
+    ("Life w/o Death", {3}, set(range(9))),           # B3/S012345678 — cells never die
+    ("Diamoeba", {3, 5, 6, 7, 8}, {5, 6, 7, 8}),    # B35678/S5678
+    ("Replicator", {1, 3, 5, 7}, {1, 3, 5, 7}),     # B1357/S1357
+    ("2x2", {3, 6}, {1, 2, 5}),                      # B36/S125
+    ("Morley", {3, 6, 8}, {2, 4, 5}),                # B368/S245 — Move
+    ("Anneal", {4, 6, 7, 8}, {3, 5, 6, 7, 8}),      # B4678/S35678
+]
+
+
+def rule_string(birth: set[int], survival: set[int]) -> str:
+    """Format a ruleset as a B/S notation string, e.g. 'B3/S23'."""
+    b = "".join(str(d) for d in sorted(birth))
+    s = "".join(str(d) for d in sorted(survival))
+    return f"B{b}/S{s}"
+
+
+# ---------------------------------------------------------------------------
 # Grid — simulation logic, decoupled from UI
 # ---------------------------------------------------------------------------
 
@@ -116,9 +141,11 @@ class Grid:
         self.cells: set[tuple[int, int]] = set()
         self.ages: dict[tuple[int, int], int] = {}  # cell -> generations alive
         self.toroidal = False
+        self.birth: set[int] = {3}        # neighbor counts that birth a cell
+        self.survival: set[int] = {2, 3}  # neighbor counts that keep a cell alive
 
     def tick(self) -> None:
-        """Advance one generation using B3/S23 rules."""
+        """Advance one generation using current birth/survival rules."""
         neighbor_count: Counter[tuple[int, int]] = Counter()
         for r, c in self.cells:
             for dr in (-1, 0, 1):
@@ -135,9 +162,14 @@ class Grid:
         new_cells = set()
         new_ages: dict[tuple[int, int], int] = {}
         for pos, count in neighbor_count.items():
-            if count == 3 or (count == 2 and pos in self.cells):
-                new_cells.add(pos)
-                new_ages[pos] = self.ages.get(pos, 0) + 1
+            if pos in self.cells:
+                if count in self.survival:
+                    new_cells.add(pos)
+                    new_ages[pos] = self.ages.get(pos, 0) + 1
+            else:
+                if count in self.birth:
+                    new_cells.add(pos)
+                    new_ages[pos] = 1
         self.cells = new_cells
         self.ages = new_ages
 
@@ -395,6 +427,8 @@ class App:
         self.detector = PatternDetector()
         self.detected_counts: dict[str, int] = {}
         self.detected_highlights: dict[tuple[int, int], str] = {}
+        # Rule explorer state
+        self.rule_idx = 0  # index into RULESETS (0 = standard Life)
         # Blueprint mode state
         self.blueprint_mode = False
         self.blueprint_cells: set[tuple[int, int]] = set()  # cells drawn in blueprint
@@ -576,6 +610,16 @@ class App:
             state = "ON" if self.dashboard else "OFF"
             self._set_message(f"Pattern dashboard {state}")
 
+        # Cycle ruleset forward
+        elif key == ord("f"):
+            self.rule_idx = (self.rule_idx + 1) % len(RULESETS)
+            self._apply_ruleset()
+
+        # Cycle ruleset backward
+        elif key == ord("g"):
+            self.rule_idx = (self.rule_idx - 1) % len(RULESETS)
+            self._apply_ruleset()
+
         # Delete custom pattern
         elif key == ord("x"):
             self._delete_custom_pattern()
@@ -656,6 +700,16 @@ class App:
             pass
 
         return True
+
+    # --- rule explorer ---
+
+    def _apply_ruleset(self) -> None:
+        """Apply the currently selected ruleset to the grid."""
+        name, birth, survival = RULESETS[self.rule_idx]
+        self.grid.birth = set(birth)
+        self.grid.survival = set(survival)
+        rs = rule_string(self.grid.birth, self.grid.survival)
+        self._set_message(f"Rule: {name} ({rs})")
 
     # --- blueprint mode ---
 
@@ -896,9 +950,12 @@ class App:
                 hist_info += f" @{self.history_pos}"
             sparkline = self._sparkline()
             spark_section = f" |{sparkline}|" if sparkline else ""
+            rule_name, _, _ = RULESETS[self.rule_idx]
+            rs = rule_string(self.grid.birth, self.grid.survival)
+            rule_info = f"{rule_name} {rs}"
             status = (
                 f" Gen: {self.generation} | Cells: {len(self.grid.cells)}{spark_section} | "
-                f"Speed: {self.speed} | {topo} | {hist_info} | {state} "
+                f"Rule: {rule_info} | Speed: {self.speed} | {topo} | {hist_info} | {state} "
             )
             if self.message_ttl > 0:
                 status += f"| {self.message} "
@@ -918,7 +975,7 @@ class App:
             help_text = (
                 f" [Space]Run [S]tep [R]and [C]lear [Q]uit | "
                 f"[P/N]Pat: {pat_name}{custom_tag} [Enter]Place [Esc]Desel | "
-                f"[D]ash [B]lue [X]Del [+/-]Spd [T]orus [</>]Rew [W]Save [O]Load"
+                f"[F/G]Rule [D]ash [B]lue [X]Del [+/-]Spd [T]orus [</>]Rew [W]Save [O]Load"
             )
             try:
                 self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
@@ -1180,7 +1237,7 @@ class App:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Conway's Game of Life — terminal simulator")
+    parser = argparse.ArgumentParser(description="Cellular Automaton Sandbox — terminal simulator")
     parser.add_argument("--width", type=int, default=0, help="Grid width (0 = auto-fit terminal)")
     parser.add_argument("--height", type=int, default=0, help="Grid height (0 = auto-fit terminal)")
     parser.add_argument("--file", type=str, default="save.json", help="Save/load file path")
