@@ -7,6 +7,7 @@ import json
 import os
 import random
 from collections import Counter
+from typing import ClassVar
 
 # ---------------------------------------------------------------------------
 # Pattern library — each pattern is a list of (row, col) offsets from origin
@@ -191,6 +192,175 @@ class Grid:
 
 
 # ---------------------------------------------------------------------------
+# Pattern detector — identifies known still lifes, oscillators, spaceships
+# ---------------------------------------------------------------------------
+
+class PatternDetector:
+    """Detects known Game of Life patterns on the grid."""
+
+    # Base pattern definitions: name → (category, cells as (row, col) offsets)
+    DEFINITIONS: ClassVar[dict[str, tuple[str, list[tuple[int, int]]]]] = {
+        # Still lifes
+        "Block":   ("still", [(0, 0), (0, 1), (1, 0), (1, 1)]),
+        "Beehive": ("still", [(0, 1), (0, 2), (1, 0), (1, 3), (2, 1), (2, 2)]),
+        "Loaf":    ("still", [(0, 1), (0, 2), (1, 0), (1, 3), (2, 1), (2, 3), (3, 2)]),
+        "Boat":    ("still", [(0, 0), (0, 1), (1, 0), (1, 2), (2, 1)]),
+        "Tub":     ("still", [(0, 1), (1, 0), (1, 2), (2, 1)]),
+        "Pond":    ("still", [(0, 1), (0, 2), (1, 0), (1, 3), (2, 0), (2, 3), (3, 1), (3, 2)]),
+        "Ship":    ("still", [(0, 0), (0, 1), (1, 0), (1, 2), (2, 1), (2, 2)]),
+        # Oscillators
+        "Blinker": ("oscillator", [(0, 0), (0, 1), (0, 2)]),
+        "Toad":    ("oscillator", [(0, 1), (0, 2), (0, 3), (1, 0), (1, 1), (1, 2)]),
+        "Beacon":  ("oscillator", [(0, 0), (0, 1), (1, 0), (1, 1), (2, 2), (2, 3), (3, 2), (3, 3)]),
+        # Spaceships
+        "Glider":  ("spaceship", [(0, 1), (1, 2), (2, 0), (2, 1), (2, 2)]),
+        "LWSS":    ("spaceship", [
+            (0, 1), (0, 4), (1, 0), (2, 0), (2, 4), (3, 0), (3, 1), (3, 2), (3, 3),
+        ]),
+    }
+
+    # Category display order
+    CATEGORIES = ["still", "oscillator", "spaceship"]
+    CATEGORY_LABELS = {"still": "Still Lifes", "oscillator": "Oscillators", "spaceship": "Spaceships"}
+
+    def __init__(self) -> None:
+        # templates: list of (name, category, size, list of frozenset variants)
+        self.templates: list[tuple[str, str, int, list[frozenset[tuple[int, int]]]]] = []
+        self._build_templates()
+
+    # --- template generation helpers ---
+
+    @staticmethod
+    def _normalize(cells) -> frozenset[tuple[int, int]]:
+        """Normalize cell offsets so min row and col are 0."""
+        if not cells:
+            return frozenset()
+        min_r = min(r for r, c in cells)
+        min_c = min(c for r, c in cells)
+        return frozenset((r - min_r, c - min_c) for r, c in cells)
+
+    @staticmethod
+    def _orientations(cells) -> set[frozenset[tuple[int, int]]]:
+        """Generate all 8 orientations (4 rotations x 2 reflections), normalized."""
+        results: set[frozenset[tuple[int, int]]] = set()
+        coords = list(cells)
+        for flip in (False, True):
+            current = [(r, -c) if flip else (r, c) for r, c in coords]
+            for _ in range(4):
+                results.add(PatternDetector._normalize(current))
+                current = [(-c, r) for r, c in current]  # 90° CW rotation
+        return results
+
+    @staticmethod
+    def _tick_isolated(cells: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        """Compute one generation for an isolated set of cells (unbounded)."""
+        neighbor_count: Counter[tuple[int, int]] = Counter()
+        for r, c in cells:
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    neighbor_count[(r + dr, c + dc)] += 1
+        new_cells: set[tuple[int, int]] = set()
+        for pos, count in neighbor_count.items():
+            if count == 3 or (count == 2 and pos in cells):
+                new_cells.add(pos)
+        return new_cells
+
+    @staticmethod
+    def _compute_phases(base_cells: list[tuple[int, int]], max_period: int = 8) -> list[list[tuple[int, int]]]:
+        """Compute all distinct phases of a pattern by simulating in isolation."""
+        phases = [list(base_cells)]
+        current = set(base_cells)
+        seen_norms: set[frozenset[tuple[int, int]]] = {PatternDetector._normalize(base_cells)}
+
+        for _ in range(max_period):
+            current = PatternDetector._tick_isolated(current)
+            if not current:
+                break
+            norm = PatternDetector._normalize(current)
+            if norm in seen_norms:
+                break
+            # Check if it's an orientation of an already-seen phase
+            orientations = PatternDetector._orientations(current)
+            if any(o in seen_norms for o in orientations):
+                break
+            seen_norms.add(norm)
+            phases.append(list(current))
+        return phases
+
+    def _build_templates(self) -> None:
+        """Build detection templates from definitions."""
+        for name, (category, base_cells) in self.DEFINITIONS.items():
+            if category == "still":
+                phases = [base_cells]
+            else:
+                phases = self._compute_phases(base_cells)
+
+            all_variants: set[frozenset[tuple[int, int]]] = set()
+            for phase in phases:
+                all_variants.update(self._orientations(phase))
+
+            self.templates.append((name, category, len(base_cells), list(all_variants)))
+
+        # Sort by size descending — match larger patterns first
+        self.templates.sort(key=lambda t: -t[2])
+
+    # --- detection ---
+
+    def detect(self, cells: set[tuple[int, int]]) -> tuple[dict[str, int], dict[tuple[int, int], str]]:
+        """Detect patterns in the given cell set.
+
+        Returns (counts, highlights) where:
+          counts: {pattern_name: count}
+          highlights: {cell_position: pattern_name}
+        """
+        remaining = set(cells)
+        counts: dict[str, int] = {}
+        highlights: dict[tuple[int, int], str] = {}
+
+        for name, category, size, variants in self.templates:
+            if len(remaining) < size:
+                continue
+            # Precompute: for each variant, pick the first cell (sorted) and
+            # compute relative offsets for the remaining cells.
+            variant_checks: list[tuple[tuple[int, int], list[tuple[int, int]], frozenset[tuple[int, int]]]] = []
+            for variant in variants:
+                sorted_cells = sorted(variant)
+                first = sorted_cells[0]
+                offsets = [(r - first[0], c - first[1]) for r, c in sorted_cells[1:]]
+                variant_checks.append((first, offsets, variant))
+
+            found = True
+            while found:
+                found = False
+                if len(remaining) < size:
+                    break
+                for first, offsets, variant in variant_checks:
+                    for ar, ac in list(remaining):
+                        # Try placing variant so that 'first' maps to (ar, ac)
+                        placed = {(ar, ac)}
+                        match = True
+                        for dr, dc in offsets:
+                            pos = (ar + dr, ac + dc)
+                            if pos not in remaining:
+                                match = False
+                                break
+                            placed.add(pos)
+                        if match:
+                            remaining -= placed
+                            counts[name] = counts.get(name, 0) + 1
+                            for cell in placed:
+                                highlights[cell] = name
+                            found = True
+                            break
+                    if found:
+                        break
+
+        return counts, highlights
+
+
+# ---------------------------------------------------------------------------
 # App — curses UI controller
 # ---------------------------------------------------------------------------
 
@@ -220,6 +390,11 @@ class App:
         self.pop_history: list[int] = []
         # Pattern library (built-in + custom, refreshed on changes)
         self._refresh_patterns()
+        # Dashboard (pattern census) state
+        self.dashboard = False
+        self.detector = PatternDetector()
+        self.detected_counts: dict[str, int] = {}
+        self.detected_highlights: dict[tuple[int, int], str] = {}
         # Blueprint mode state
         self.blueprint_mode = False
         self.blueprint_cells: set[tuple[int, int]] = set()  # cells drawn in blueprint
@@ -268,6 +443,11 @@ class App:
             curses.init_pair(5, curses.COLOR_CYAN, -1)    # young cells
             curses.init_pair(6, curses.COLOR_YELLOW, -1)  # mature cells
             curses.init_pair(7, curses.COLOR_RED, -1)     # ancient cells
+            # Dashboard highlight colors (pattern categories)
+            curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_BLUE)     # still life
+            curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_MAGENTA)  # oscillator
+            curses.init_pair(10, curses.COLOR_WHITE, curses.COLOR_RED)     # spaceship
+            curses.init_pair(11, curses.COLOR_CYAN, -1)                   # dashboard text
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -389,6 +569,12 @@ class App:
         # Enter blueprint mode
         elif key == ord("b"):
             self._enter_blueprint()
+
+        # Toggle dashboard
+        elif key == ord("d"):
+            self.dashboard = not self.dashboard
+            state = "ON" if self.dashboard else "OFF"
+            self._set_message(f"Pattern dashboard {state}")
 
         # Delete custom pattern
         elif key == ord("x"):
@@ -622,7 +808,27 @@ class App:
 
         self.stdscr.refresh()
 
+    DASHBOARD_WIDTH = 22  # sidebar width in characters
+
+    def _category_color_pair(self, pattern_name: str) -> int:
+        """Return color pair for highlighting a detected pattern."""
+        cat = self.detector.DEFINITIONS.get(pattern_name, ("still",))[0]
+        return {
+            "still": 8,
+            "oscillator": 9,
+            "spaceship": 10,
+        }.get(cat, 8)
+
     def _draw_normal(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        # Run pattern detection if dashboard is visible
+        sidebar_w = 0
+        if self.dashboard:
+            self.detected_counts, self.detected_highlights = self.detector.detect(
+                self.grid.cells
+            )
+            sidebar_w = min(self.DASHBOARD_WIDTH, max_w // 3)
+            grid_cols = max(1, (max_w - sidebar_w) // 2)
+
         # Build ghost preview set for pattern
         ghost: set[tuple[int, int]] = set()
         if self.pattern_idx is not None:
@@ -640,7 +846,7 @@ class App:
                 if c >= self.grid.width:
                     break
                 x = screen_c * 2
-                if x + 1 >= max_w:
+                if x + 1 >= max_w - sidebar_w:
                     break
 
                 is_alive = (r, c) in self.grid.cells
@@ -653,7 +859,12 @@ class App:
                         attr |= curses.color_pair(2)
                     ch = "██" if is_alive else "▒▒"
                 elif is_alive:
-                    if self.use_color:
+                    if self.dashboard and self.use_color and (r, c) in self.detected_highlights:
+                        # Highlight with category color
+                        attr = curses.color_pair(
+                            self._category_color_pair(self.detected_highlights[(r, c)])
+                        ) | curses.A_BOLD
+                    elif self.use_color:
                         age = self.grid.ages.get((r, c), 1)
                         attr = curses.color_pair(self._age_color_pair(age))
                     else:
@@ -670,6 +881,10 @@ class App:
                     self.stdscr.addstr(screen_r, x, ch, attr)
                 except curses.error:
                     pass
+
+        # Draw dashboard sidebar
+        if self.dashboard and sidebar_w > 2:
+            self._draw_dashboard(max_h, max_w, grid_rows, sidebar_w)
 
         # Status bar
         status_y = max_h - 2
@@ -702,13 +917,77 @@ class App:
             custom_tag = f" (+{custom_count} custom)" if custom_count > 0 else ""
             help_text = (
                 f" [Space]Run [S]tep [R]and [C]lear [Q]uit | "
-                f"[P/N]Pattern: {pat_name}{custom_tag} [Enter]Place [Esc]Desel | "
-                f"[B]lueprint [X]Del [+/-]Spd [T]orus [</>]Rew [W]Save [O]Load"
+                f"[P/N]Pat: {pat_name}{custom_tag} [Enter]Place [Esc]Desel | "
+                f"[D]ash [B]lue [X]Del [+/-]Spd [T]orus [</>]Rew [W]Save [O]Load"
             )
             try:
                 self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
             except curses.error:
                 pass
+
+    def _draw_dashboard(self, max_h: int, max_w: int, grid_rows: int, sidebar_w: int) -> None:
+        """Draw the pattern census sidebar on the right side of the screen."""
+        sx = max_w - sidebar_w  # sidebar start x
+        inner_w = sidebar_w - 2  # content width (minus borders)
+        row = 0
+
+        def put(y: int, text: str, attr: int = 0) -> None:
+            if 0 <= y < grid_rows:
+                line = text[:sidebar_w]
+                try:
+                    self.stdscr.addstr(y, sx, line, attr)
+                except curses.error:
+                    pass
+
+        # Header
+        header_attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+        put(row, " PATTERN CENSUS ".center(sidebar_w, "─"), header_attr)
+        row += 1
+
+        # Compute unclassified count
+        classified = sum(self.detected_counts.values())
+        total_cells = len(self.grid.cells)
+        unclassified_cells = total_cells - len(self.detected_highlights)
+
+        # Group by category
+        cat_color = {"still": 8, "oscillator": 9, "spaceship": 10}
+        for cat in PatternDetector.CATEGORIES:
+            label = PatternDetector.CATEGORY_LABELS[cat]
+            cat_attr = curses.color_pair(cat_color[cat]) | curses.A_BOLD if self.use_color else curses.A_BOLD
+            if row < grid_rows:
+                put(row, f"─{label}─".ljust(sidebar_w, "─"), cat_attr)
+                row += 1
+
+            found_any = False
+            for name, (pcat, _) in PatternDetector.DEFINITIONS.items():
+                if pcat != cat:
+                    continue
+                count = self.detected_counts.get(name, 0)
+                if count > 0:
+                    found_any = True
+                    line = f" {name}: {count}"
+                    text_attr = curses.color_pair(11) if self.use_color else 0
+                    if row < grid_rows:
+                        put(row, line.ljust(sidebar_w), text_attr)
+                        row += 1
+
+            if not found_any and row < grid_rows:
+                dim = curses.A_DIM
+                put(row, " (none)".ljust(sidebar_w), dim)
+                row += 1
+
+        # Separator and summary
+        if row < grid_rows:
+            put(row, "─" * sidebar_w, curses.A_DIM)
+            row += 1
+        if row < grid_rows:
+            summary_attr = curses.color_pair(11) if self.use_color else 0
+            put(row, f" Classified: {classified}".ljust(sidebar_w), summary_attr)
+            row += 1
+        if row < grid_rows:
+            other_attr = curses.A_DIM
+            put(row, f" Other cells: {unclassified_cells}".ljust(sidebar_w), other_attr)
+            row += 1
 
     def _draw_blueprint(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
         """Draw the blueprint editing canvas."""
