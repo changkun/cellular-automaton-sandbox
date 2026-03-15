@@ -977,6 +977,162 @@ class ReactionDiffusionGrid:
         return count
 
 
+# ---------------------------------------------------------------------------
+# Particle Life — continuous-space particle simulation
+# ---------------------------------------------------------------------------
+
+# Number of particle types (colors)
+PL_NUM_TYPES = 6
+
+# Particle type color names (for display)
+PL_TYPE_NAMES = ["Red", "Green", "Blue", "Yellow", "Cyan", "Magenta"]
+
+# Shade characters for rendering particles
+PL_SHADES = "●"
+
+
+class ParticleLifeWorld:
+    """Continuous-space particle life simulation.
+
+    Particles of different color types attract or repel each other based on
+    a randomized interaction matrix.  Despite trivially simple rules, this
+    produces stunning emergent behaviors — clusters, orbits, chains, and
+    cell-like structures that look remarkably alive.
+
+    Each particle has continuous (x, y) position and (vx, vy) velocity.
+    Forces between particles follow a piecewise-linear profile that is
+    repulsive at very short range and attractive (or repulsive, depending
+    on the matrix entry) at medium range, tapering to zero at ``rmax``.
+    """
+
+    def __init__(self, width: float, height: float, n_particles: int = 300):
+        self.width = width
+        self.height = height
+        self.n_particles = n_particles
+        self.num_types = PL_NUM_TYPES
+        self.friction = 0.05        # velocity damping per tick
+        self.dt = 0.02              # integration time step
+        self.rmax = 80.0            # max interaction radius (in pixel units)
+        self.force_scale = 5.0      # global force multiplier
+        self.beta = 0.3             # repulsion distance as fraction of rmax
+
+        # Particle state arrays
+        self.px: list[float] = []   # x positions
+        self.py: list[float] = []   # y positions
+        self.vx: list[float] = []   # x velocities
+        self.vy: list[float] = []   # y velocities
+        self.pt: list[int] = []     # type indices
+
+        # Interaction matrix: attraction[i][j] = force of type j on type i
+        # Values in [-1, 1]; positive = attract, negative = repel
+        self.attraction: list[list[float]] = []
+
+        self.randomize_matrix()
+        self.seed_random()
+
+    def randomize_matrix(self) -> None:
+        """Generate a new random interaction matrix."""
+        self.attraction = [
+            [random.uniform(-1.0, 1.0) for _ in range(self.num_types)]
+            for _ in range(self.num_types)
+        ]
+
+    def seed_random(self) -> None:
+        """Place particles randomly across the world."""
+        self.px = [random.uniform(0, self.width) for _ in range(self.n_particles)]
+        self.py = [random.uniform(0, self.height) for _ in range(self.n_particles)]
+        self.vx = [0.0] * self.n_particles
+        self.vy = [0.0] * self.n_particles
+        self.pt = [random.randint(0, self.num_types - 1) for _ in range(self.n_particles)]
+
+    def _force(self, r: float, a: float) -> float:
+        """Compute force magnitude at distance r with attraction a.
+
+        Piecewise-linear force profile:
+        - [0, beta*rmax]: repulsion (universal, pushes apart at close range)
+        - [beta*rmax, rmax]: attraction or repulsion per matrix entry
+        - [rmax, inf]: zero (no interaction)
+        """
+        beta = self.beta
+        if r < beta * self.rmax:
+            # Short-range repulsion: linearly from -1 at r=0 to 0 at r=beta*rmax
+            return r / (beta * self.rmax) - 1.0
+        elif r < self.rmax:
+            # Medium range: linearly ramp from 0 to a and back to 0
+            numer = r - beta * self.rmax
+            denom = self.rmax - beta * self.rmax
+            if denom < 1e-9:
+                return 0.0
+            t = numer / denom
+            # Triangular profile peaking at a in the middle
+            if t < 0.5:
+                return a * (2.0 * t)
+            else:
+                return a * (2.0 - 2.0 * t)
+        return 0.0
+
+    def tick(self) -> None:
+        """Advance the simulation by one time step."""
+        n = self.n_particles
+        w = self.width
+        h = self.height
+        rmax = self.rmax
+        rmax2 = rmax * rmax
+        dt = self.dt
+        fscale = self.force_scale
+        friction = self.friction
+
+        # Compute forces
+        fx = [0.0] * n
+        fy = [0.0] * n
+
+        for i in range(n):
+            xi, yi, ti = self.px[i], self.py[i], self.pt[i]
+            total_fx = 0.0
+            total_fy = 0.0
+            for j in range(n):
+                if i == j:
+                    continue
+                dx = self.px[j] - xi
+                dy = self.py[j] - yi
+                # Toroidal wrapping for distance
+                if dx > w * 0.5:
+                    dx -= w
+                elif dx < -w * 0.5:
+                    dx += w
+                if dy > h * 0.5:
+                    dy -= h
+                elif dy < -h * 0.5:
+                    dy += h
+                r2 = dx * dx + dy * dy
+                if r2 > rmax2 or r2 < 1e-6:
+                    continue
+                r = math.sqrt(r2)
+                a = self.attraction[ti][self.pt[j]]
+                f = self._force(r, a) * fscale
+                total_fx += f * dx / r
+                total_fy += f * dy / r
+            fx[i] = total_fx
+            fy[i] = total_fy
+
+        # Integrate velocities and positions
+        for i in range(n):
+            self.vx[i] = self.vx[i] * (1.0 - friction) + fx[i] * dt
+            self.vy[i] = self.vy[i] * (1.0 - friction) + fy[i] * dt
+            self.px[i] += self.vx[i] * dt
+            self.py[i] += self.vy[i] * dt
+            # Wrap around (toroidal)
+            self.px[i] %= w
+            self.py[i] %= h
+
+    def population_by_type(self) -> list[int]:
+        """Count particles per type."""
+        counts = [0] * self.num_types
+        for t in self.pt:
+            counts[t] += 1
+        return counts
+
+
 class LeniaGrid:
     """Continuous-state cellular automaton grid (Lenia).
 
@@ -1625,6 +1781,10 @@ class App:
         self.rd_grid: ReactionDiffusionGrid | None = None
         self.rd_gen = 0
         self.rd_preset_idx = 0  # index into RD_PRESET_NAMES
+        # Particle Life mode
+        self.pl_mode = False
+        self.pl_world: ParticleLifeWorld | None = None
+        self.pl_gen = 0
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -1656,6 +1816,9 @@ class App:
             elif self.rd_mode:
                 if self.running:
                     self._rd_tick()
+            elif self.pl_mode:
+                if self.running:
+                    self._pl_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -1728,6 +1891,13 @@ class App:
             curses.init_pair(36, curses.COLOR_GREEN, -1)   # RD: mid V
             curses.init_pair(37, curses.COLOR_YELLOW, -1)  # RD: mid-high V
             curses.init_pair(38, curses.COLOR_RED, -1)     # RD: high V (bright)
+            # Particle Life type colors
+            curses.init_pair(39, curses.COLOR_RED, -1)      # PL: type 0 Red
+            curses.init_pair(40, curses.COLOR_GREEN, -1)    # PL: type 1 Green
+            curses.init_pair(41, curses.COLOR_BLUE, -1)     # PL: type 2 Blue
+            curses.init_pair(42, curses.COLOR_YELLOW, -1)   # PL: type 3 Yellow
+            curses.init_pair(43, curses.COLOR_CYAN, -1)     # PL: type 4 Cyan
+            curses.init_pair(44, curses.COLOR_MAGENTA, -1)  # PL: type 5 Magenta
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -1790,6 +1960,10 @@ class App:
         # Reaction-Diffusion mode has its own input handler
         if self.rd_mode:
             return self._handle_rd_input(key)
+
+        # Particle Life mode has its own input handler
+        if self.pl_mode:
+            return self._handle_pl_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -1978,6 +2152,10 @@ class App:
         # Reaction-Diffusion (Gray-Scott) mode
         elif key == ord("R"):
             self._start_rd()
+
+        # Particle Life mode
+        elif key == ord("P"):
+            self._start_pl()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -3088,6 +3266,163 @@ class App:
             except curses.error:
                 pass
 
+    # --- Particle Life mode ---
+
+    def _handle_pl_input(self, key: int) -> bool:
+        """Handle input while in particle life mode."""
+        if key == ord("q"):
+            return False
+        # Run / pause
+        elif key == ord(" "):
+            self.running = not self.running
+        # Step
+        elif key == ord("s"):
+            if not self.running:
+                self._pl_tick()
+        # Randomize particles
+        elif key == ord("r"):
+            if self.pl_world:
+                self.pl_world.seed_random()
+                self.pl_gen = 0
+                self._set_message("Particles randomized")
+        # New interaction matrix
+        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+            if self.pl_world:
+                self.pl_world.randomize_matrix()
+                self.pl_world.seed_random()
+                self.pl_gen = 0
+                self._set_message("New interaction matrix")
+        # Clear (reset everything)
+        elif key == ord("c"):
+            if self.pl_world:
+                self.pl_world.randomize_matrix()
+                self.pl_world.seed_random()
+                self.pl_gen = 0
+                self._set_message("Cleared & reset")
+        # Adjust particle count
+        elif key == ord("]") or key == ord("+") or key == ord("="):
+            if self.pl_world:
+                self.pl_world.n_particles = min(600, self.pl_world.n_particles + 50)
+                self.pl_world.seed_random()
+                self.pl_gen = 0
+                self._set_message(f"Particles: {self.pl_world.n_particles}")
+        elif key == ord("[") or key == ord("-") or key == ord("_"):
+            if self.pl_world:
+                self.pl_world.n_particles = max(50, self.pl_world.n_particles - 50)
+                self.pl_world.seed_random()
+                self.pl_gen = 0
+                self._set_message(f"Particles: {self.pl_world.n_particles}")
+        # Adjust friction
+        elif key == ord("f"):
+            if self.pl_world:
+                self.pl_world.friction = min(0.5, self.pl_world.friction + 0.01)
+                self._set_message(f"Friction: {self.pl_world.friction:.2f}")
+        elif key == ord("g"):
+            if self.pl_world:
+                self.pl_world.friction = max(0.0, self.pl_world.friction - 0.01)
+                self._set_message(f"Friction: {self.pl_world.friction:.2f}")
+        # Speed control
+        elif key == ord(">"):
+            self.speed = min(20, self.speed + 1)
+            self._update_timeout()
+        elif key == ord("<"):
+            self.speed = max(1, self.speed - 1)
+            self._update_timeout()
+        # Exit Particle Life mode
+        elif key == ord("P") or key == 27:
+            self._stop_pl()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_pl(self) -> None:
+        """Enter particle life mode."""
+        self.running = False
+        self.pl_mode = True
+        self.pl_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        # World size in pixel-equivalent units (each terminal cell = 2 pixels wide)
+        w = max(1, max_w)
+        h = max(1, max_h - 3)
+        self.pl_world = ParticleLifeWorld(float(w), float(h), n_particles=300)
+        self._set_message(
+            "Particle Life — [Space]Run [S]tep [R]and [Enter]NewMatrix [P]Exit"
+        )
+
+    def _stop_pl(self) -> None:
+        """Exit particle life mode."""
+        self.pl_mode = False
+        self.running = False
+        self.pl_world = None
+        self.pl_gen = 0
+        self._set_message("Particle Life mode ended")
+
+    def _pl_tick(self) -> None:
+        """Advance one particle life generation."""
+        if self.pl_world:
+            self.pl_world.tick()
+            self.pl_gen += 1
+
+    PL_COLOR_PAIRS = [39, 40, 41, 42, 43, 44]  # color pairs for particle types
+
+    def _draw_pl(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the particle life world."""
+        if not self.pl_world:
+            return
+        pw = self.pl_world
+
+        # Render particles onto a screen buffer
+        # Each terminal cell is 1 char wide, particles have continuous coords
+        # We'll draw each particle as a single character at its position
+        drawn: dict[tuple[int, int], int] = {}  # (row, col) -> particle type
+
+        for i in range(pw.n_particles):
+            # Map continuous coords to screen coords
+            screen_c = int(pw.px[i])
+            screen_r = int(pw.py[i])
+            if 0 <= screen_r < grid_rows and 0 <= screen_c < max_w - 1:
+                drawn[(screen_r, screen_c)] = pw.pt[i]
+
+        for (r, c), t in drawn.items():
+            pair = self.PL_COLOR_PAIRS[t % len(self.PL_COLOR_PAIRS)]
+            attr = curses.color_pair(pair) | curses.A_BOLD if self.use_color else curses.A_BOLD
+            try:
+                self.stdscr.addstr(r, c, PL_SHADES, attr)
+            except curses.error:
+                pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            state_str = "RUNNING" if self.running else "PAUSED"
+            counts = pw.population_by_type()
+            type_str = " ".join(f"{PL_TYPE_NAMES[i][0]}:{counts[i]}" for i in range(pw.num_types))
+            status = (
+                f" Particle Life | Gen: {self.pl_gen} | "
+                f"N={pw.n_particles} Friction={pw.friction:.2f} | "
+                f"{type_str} | Speed: {self.speed} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]and [C]lear [Enter]NewMatrix | "
+                "[F/G]Friction [+/-]Particles [</>]Spd | [P]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -3419,6 +3754,8 @@ class App:
             self._draw_sand(max_h, max_w, grid_rows, grid_cols)
         elif self.rd_mode:
             self._draw_rd(max_h, max_w, grid_rows, grid_cols)
+        elif self.pl_mode:
+            self._draw_pl(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
