@@ -3016,6 +3016,320 @@ class TurmiteWorld:
 
 
 # ---------------------------------------------------------------------------
+# Hydraulic Erosion simulation
+# ---------------------------------------------------------------------------
+
+EROSION_PRESETS = {
+    "gentle-hills": {
+        "desc": "Gentle rolling hills with light rainfall",
+        "rain_rate": 0.002,
+        "evaporation": 0.02,
+        "erosion_rate": 0.3,
+        "deposition_rate": 0.3,
+        "sediment_capacity": 0.05,
+        "min_slope": 0.01,
+        "gravity": 4.0,
+        "terrain": "hills",
+    },
+    "mountain-range": {
+        "desc": "Tall mountain range with heavy erosion",
+        "rain_rate": 0.005,
+        "evaporation": 0.015,
+        "erosion_rate": 0.5,
+        "deposition_rate": 0.2,
+        "sediment_capacity": 0.08,
+        "min_slope": 0.01,
+        "gravity": 6.0,
+        "terrain": "mountains",
+    },
+    "canyon-carver": {
+        "desc": "Concentrated rainfall carves deep canyons",
+        "rain_rate": 0.008,
+        "evaporation": 0.01,
+        "erosion_rate": 0.7,
+        "deposition_rate": 0.15,
+        "sediment_capacity": 0.12,
+        "min_slope": 0.005,
+        "gravity": 8.0,
+        "terrain": "plateau",
+    },
+    "river-delta": {
+        "desc": "Wide flat terrain forming river deltas",
+        "rain_rate": 0.004,
+        "evaporation": 0.025,
+        "erosion_rate": 0.2,
+        "deposition_rate": 0.5,
+        "sediment_capacity": 0.04,
+        "min_slope": 0.002,
+        "gravity": 3.0,
+        "terrain": "flat",
+    },
+    "volcanic": {
+        "desc": "Volcanic cone eroded by intense rain",
+        "rain_rate": 0.006,
+        "evaporation": 0.02,
+        "erosion_rate": 0.6,
+        "deposition_rate": 0.25,
+        "sediment_capacity": 0.1,
+        "min_slope": 0.01,
+        "gravity": 7.0,
+        "terrain": "volcano",
+    },
+}
+
+EROSION_PRESET_NAMES = list(EROSION_PRESETS.keys())
+
+
+class ErosionWorld:
+    """Hydraulic erosion simulation on a heightmap.
+
+    Simulates rainfall, water flow, sediment transport, erosion, and
+    deposition to carve realistic river valleys and terrain features.
+    """
+
+    def __init__(self, width: int, height: int, preset: str = "gentle-hills"):
+        self.width = width
+        self.height = height
+        self.preset_idx = EROSION_PRESET_NAMES.index(preset)
+        self.steps_per_tick = 1
+
+        # Heightmap, water, sediment, velocity grids
+        self.terrain: list[list[float]] = [[0.0] * width for _ in range(height)]
+        self.water: list[list[float]] = [[0.0] * width for _ in range(height)]
+        self.sediment: list[list[float]] = [[0.0] * width for _ in range(height)]
+        self.velocity: list[list[float]] = [[0.0] * width for _ in range(height)]
+        # Track cumulative erosion for visualization
+        self.erosion_map: list[list[float]] = [[0.0] * width for _ in range(height)]
+
+        self._apply_preset(preset)
+
+    def _apply_preset(self, name: str) -> None:
+        p = EROSION_PRESETS[name]
+        self.rain_rate = p["rain_rate"]
+        self.evaporation = p["evaporation"]
+        self.erosion_rate = p["erosion_rate"]
+        self.deposition_rate = p["deposition_rate"]
+        self.sediment_capacity = p["sediment_capacity"]
+        self.min_slope = p["min_slope"]
+        self.gravity = p["gravity"]
+        self._generate_terrain(p["terrain"])
+
+    def _generate_terrain(self, style: str) -> None:
+        """Generate initial heightmap."""
+        w, h = self.width, self.height
+        for r in range(h):
+            for c in range(w):
+                self.water[r][c] = 0.0
+                self.sediment[r][c] = 0.0
+                self.velocity[r][c] = 0.0
+                self.erosion_map[r][c] = 0.0
+
+        if style == "hills":
+            # Multiple overlapping sine hills
+            for r in range(h):
+                for c in range(w):
+                    v = 0.0
+                    v += 0.3 * math.sin(r * math.pi / h) * math.sin(c * math.pi / w)
+                    v += 0.15 * math.sin(r * 3.7 * math.pi / h) * math.cos(c * 2.3 * math.pi / w)
+                    v += 0.1 * math.cos(r * 5.1 * math.pi / h) * math.sin(c * 4.7 * math.pi / w)
+                    v += random.uniform(0, 0.02)
+                    self.terrain[r][c] = max(0.0, v)
+        elif style == "mountains":
+            # Ridge-like formation
+            cx, cy = w / 2, h / 2
+            for r in range(h):
+                for c in range(w):
+                    dx = (c - cx) / (w / 2)
+                    ridge = max(0, 1.0 - abs(dx) * 2.0)
+                    ridge *= 0.5 + 0.5 * math.sin(r * math.pi / h)
+                    noise = 0.08 * math.sin(r * 7.3 / h * math.pi) * math.cos(c * 5.9 / w * math.pi)
+                    noise += 0.04 * math.sin(r * 13.1 / h * math.pi + c * 9.7 / w * math.pi)
+                    v = ridge * 0.8 + noise + random.uniform(0, 0.02)
+                    self.terrain[r][c] = max(0.0, v)
+        elif style == "plateau":
+            # Flat plateau with edge dropoffs
+            for r in range(h):
+                for c in range(w):
+                    edge_r = min(r, h - 1 - r) / (h / 3)
+                    edge_c = min(c, w - 1 - c) / (w / 3)
+                    edge = min(1.0, min(edge_r, edge_c))
+                    v = 0.6 * edge + 0.05 * math.sin(r * 4.3 / h * math.pi) * math.cos(c * 3.7 / w * math.pi)
+                    v += random.uniform(0, 0.015)
+                    self.terrain[r][c] = max(0.0, v)
+        elif style == "flat":
+            # Gently sloped plain
+            for r in range(h):
+                for c in range(w):
+                    slope = 0.2 * (1.0 - r / h)
+                    noise = 0.03 * math.sin(r * 5.1 / h * math.pi) * math.sin(c * 3.3 / w * math.pi)
+                    noise += 0.02 * math.cos(r * 8.7 / h * math.pi + c * 6.1 / w * math.pi)
+                    v = slope + noise + random.uniform(0, 0.01)
+                    self.terrain[r][c] = max(0.0, v)
+        elif style == "volcano":
+            # Conical volcano
+            cx, cy = w / 2, h / 2
+            max_dist = math.sqrt(cx * cx + cy * cy)
+            for r in range(h):
+                for c in range(w):
+                    dx, dy = c - cx, r - cy
+                    dist = math.sqrt(dx * dx + dy * dy) / max_dist
+                    # Cone shape with crater
+                    v = max(0, 0.9 - dist * 1.2)
+                    if dist < 0.1:
+                        v = max(0, v - 0.15 * (1 - dist / 0.1))
+                    noise = 0.04 * math.sin(math.atan2(dy, dx) * 7) * (1 - dist)
+                    v += noise + random.uniform(0, 0.015)
+                    self.terrain[r][c] = max(0.0, v)
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(EROSION_PRESET_NAMES)
+        name = EROSION_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def reset(self) -> None:
+        """Reset to initial terrain for current preset."""
+        name = EROSION_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+
+    def tick(self) -> None:
+        """Advance simulation by steps_per_tick steps."""
+        for _ in range(self.steps_per_tick):
+            self._step()
+
+    def _step(self) -> None:
+        """Single erosion simulation step."""
+        w, h = self.width, self.height
+        terrain = self.terrain
+        water = self.water
+        sediment = self.sediment
+        velocity = self.velocity
+        erosion_map = self.erosion_map
+
+        # 1. Rainfall — add water uniformly with some randomness
+        rain = self.rain_rate
+        for r in range(h):
+            for c in range(w):
+                if random.random() < 0.3:
+                    water[r][c] += rain * (1.0 + random.uniform(0, 1.0))
+
+        # 2. Water flow and erosion — each cell flows to lowest neighbor
+        new_terrain = [row[:] for row in terrain]
+        new_water = [row[:] for row in water]
+        new_sediment = [row[:] for row in sediment]
+        new_velocity = [[0.0] * w for _ in range(h)]
+
+        for r in range(h):
+            for c in range(w):
+                if water[r][c] < 1e-6:
+                    continue
+
+                cur_height = terrain[r][c] + water[r][c]
+
+                # Find lowest neighbor
+                best_r, best_c = r, c
+                best_h = cur_height
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < h and 0 <= nc < w:
+                        nh = terrain[nr][nc] + water[nr][nc]
+                        if nh < best_h:
+                            best_h = nh
+                            best_r, best_c = nr, nc
+
+                if best_r == r and best_c == c:
+                    # No lower neighbor — just deposit sediment
+                    deposit = sediment[r][c] * self.deposition_rate
+                    new_terrain[r][c] += deposit
+                    new_sediment[r][c] -= deposit
+                    continue
+
+                # Height difference determines flow
+                dh = cur_height - best_h
+                # Flow amount — limited by available water and height diff
+                flow = min(water[r][c], dh * 0.5)
+                if flow < 1e-7:
+                    continue
+
+                # Update velocity
+                new_vel = math.sqrt(velocity[r][c] ** 2 + dh * self.gravity)
+                new_vel = min(new_vel, 3.0)  # cap velocity
+
+                # Sediment capacity based on velocity and slope
+                slope = max(dh, self.min_slope)
+                capacity = slope * new_vel * self.sediment_capacity * flow
+
+                # Erosion or deposition
+                cur_sed = sediment[r][c]
+                if cur_sed < capacity:
+                    # Erode terrain
+                    erode = min((capacity - cur_sed) * self.erosion_rate, terrain[r][c] * 0.5)
+                    new_terrain[r][c] -= erode
+                    new_sediment[r][c] += erode
+                    erosion_map[r][c] += erode
+                else:
+                    # Deposit sediment
+                    deposit = (cur_sed - capacity) * self.deposition_rate
+                    new_terrain[r][c] += deposit
+                    new_sediment[r][c] -= deposit
+
+                # Transfer water and sediment to lowest neighbor
+                sed_ratio = new_sediment[r][c] / (water[r][c] + 1e-9)
+                flow_sed = flow * sed_ratio
+
+                new_water[r][c] -= flow
+                new_water[best_r][best_c] += flow
+                new_sediment[r][c] -= flow_sed
+                new_sediment[best_r][best_c] += flow_sed
+                new_velocity[best_r][best_c] = new_vel
+
+        # 3. Evaporation
+        evap = self.evaporation
+        for r in range(h):
+            for c in range(w):
+                new_water[r][c] *= (1.0 - evap)
+                if new_water[r][c] < 1e-6:
+                    # Deposit remaining sediment when water evaporates
+                    new_terrain[r][c] += new_sediment[r][c]
+                    new_sediment[r][c] = 0.0
+                    new_water[r][c] = 0.0
+
+        # Clamp values
+        for r in range(h):
+            for c in range(w):
+                new_terrain[r][c] = max(0.0, new_terrain[r][c])
+                new_water[r][c] = max(0.0, new_water[r][c])
+                new_sediment[r][c] = max(0.0, new_sediment[r][c])
+
+        self.terrain = new_terrain
+        self.water = new_water
+        self.sediment = new_sediment
+        self.velocity = new_velocity
+
+    @property
+    def stats(self) -> dict:
+        """Return simulation statistics."""
+        total_water = 0.0
+        total_sediment = 0.0
+        max_height = 0.0
+        max_water = 0.0
+        for r in range(self.height):
+            for c in range(self.width):
+                total_water += self.water[r][c]
+                total_sediment += self.sediment[r][c]
+                if self.terrain[r][c] > max_height:
+                    max_height = self.terrain[r][c]
+                if self.water[r][c] > max_water:
+                    max_water = self.water[r][c]
+        return {
+            "total_water": total_water,
+            "total_sediment": total_sediment,
+            "max_height": max_height,
+            "max_water": max_water,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Pattern detector — identifies known still lifes, oscillators, spaceships
 # ---------------------------------------------------------------------------
 
@@ -3592,6 +3906,11 @@ class App:
         self.turmite_world: TurmiteWorld | None = None
         self.turmite_gen = 0
         self.turmite_preset_idx = 0
+        # Hydraulic Erosion mode
+        self.erosion_mode = False
+        self.erosion_world: ErosionWorld | None = None
+        self.erosion_gen = 0
+        self.erosion_preset_idx = 0
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -3650,6 +3969,9 @@ class App:
             elif self.turmite_mode:
                 if self.running:
                     self._turmite_tick()
+            elif self.erosion_mode:
+                if self.running:
+                    self._erosion_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -3777,6 +4099,14 @@ class App:
             curses.init_pair(93, curses.COLOR_RED, -1)     # Turmite: head
             curses.init_pair(94, curses.COLOR_YELLOW, -1)  # Turmite: head alt
             curses.init_pair(95, curses.COLOR_GREEN, -1)   # Turmite: trail highlight
+            # Hydraulic Erosion colors
+            curses.init_pair(100, curses.COLOR_BLUE, -1)    # Erosion: deep water
+            curses.init_pair(101, curses.COLOR_CYAN, -1)    # Erosion: shallow water
+            curses.init_pair(102, curses.COLOR_GREEN, -1)   # Erosion: low terrain
+            curses.init_pair(103, curses.COLOR_YELLOW, -1)  # Erosion: mid terrain
+            curses.init_pair(104, curses.COLOR_RED, -1)     # Erosion: high terrain
+            curses.init_pair(105, curses.COLOR_WHITE, -1)   # Erosion: peak/snow
+            curses.init_pair(106, curses.COLOR_MAGENTA, -1) # Erosion: sediment
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -3875,6 +4205,10 @@ class App:
         # Turmite mode has its own input handler
         if self.turmite_mode:
             return self._handle_turmite_input(key)
+
+        # Erosion mode has its own input handler
+        if self.erosion_mode:
+            return self._handle_erosion_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -4099,6 +4433,10 @@ class App:
         # Langton's Turmites mode
         elif key == ord("U"):
             self._start_turmite()
+
+        # Hydraulic Erosion mode
+        elif key == ord("Y"):
+            self._start_erosion()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -6904,6 +7242,197 @@ class App:
             except curses.error:
                 pass
 
+    # --- Hydraulic Erosion mode ---
+
+    def _handle_erosion_input(self, key: int) -> bool:
+        """Handle input while in Erosion mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            if not self.running:
+                self._erosion_tick()
+        elif key == ord("r"):
+            if self.erosion_world:
+                self.erosion_world.reset()
+                self.erosion_gen = 0
+                self._set_message("Reset")
+        # Cycle preset forward/back
+        elif key == ord("p") or key == ord("n"):
+            if self.erosion_world:
+                direction = 1 if key == ord("n") else -1
+                name = self.erosion_world.cycle_preset(direction)
+                self.erosion_preset_idx = self.erosion_world.preset_idx
+                self.erosion_gen = 0
+                self._set_message(f"Preset: {name}")
+        # Steps per tick
+        elif key == ord("]"):
+            if self.erosion_world:
+                self.erosion_world.steps_per_tick = min(50, self.erosion_world.steps_per_tick * 2)
+                self._set_message(f"Steps/tick: {self.erosion_world.steps_per_tick}")
+        elif key == ord("["):
+            if self.erosion_world:
+                self.erosion_world.steps_per_tick = max(1, self.erosion_world.steps_per_tick // 2)
+                self._set_message(f"Steps/tick: {self.erosion_world.steps_per_tick}")
+        # Rain intensity control
+        elif key == ord("+") or key == ord("="):
+            if self.erosion_world:
+                self.erosion_world.rain_rate = min(0.05, self.erosion_world.rain_rate * 1.5)
+                self._set_message(f"Rain: {self.erosion_world.rain_rate:.4f}")
+        elif key == ord("-") or key == ord("_"):
+            if self.erosion_world:
+                self.erosion_world.rain_rate = max(0.0005, self.erosion_world.rain_rate / 1.5)
+                self._set_message(f"Rain: {self.erosion_world.rain_rate:.4f}")
+        # Speed control
+        elif key == ord("f"):
+            self.speed = min(20, self.speed + 1)
+            self._update_timeout()
+        elif key == ord("d"):
+            self.speed = max(1, self.speed - 1)
+            self._update_timeout()
+        # Exit Erosion mode
+        elif key == ord("Y") or key == 27:
+            self._stop_erosion()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_erosion(self) -> None:
+        """Enter Erosion mode."""
+        self.running = False
+        self.erosion_mode = True
+        self.erosion_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(4, max_w // 2)
+        h = max(4, max_h - 3)
+        preset = EROSION_PRESET_NAMES[self.erosion_preset_idx]
+        self.erosion_world = ErosionWorld(w, h, preset=preset)
+        self._set_message(
+            "Erosion — [Space]Run [P/N]Preset [+/-]Rain [Shift+Y]Exit"
+        )
+
+    def _stop_erosion(self) -> None:
+        """Exit Erosion mode."""
+        self.erosion_mode = False
+        self.running = False
+        self.erosion_world = None
+        self.erosion_gen = 0
+        self._set_message("Erosion mode ended")
+
+    def _erosion_tick(self) -> None:
+        """Advance one erosion step."""
+        if self.erosion_world:
+            self.erosion_world.tick()
+            self.erosion_gen += 1
+
+    def _draw_erosion(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the erosion simulation with terrain height and water visualization."""
+        if not self.erosion_world:
+            return
+        ew = self.erosion_world
+
+        # Height characters from low to high
+        height_chars = ["  ", "░░", "▒▒", "▓▓", "██"]
+        water_chars = ["~~", "≈≈", "██"]
+
+        # Find height range for normalization
+        max_terrain = 0.01
+        for r in range(ew.height):
+            for c in range(ew.width):
+                if ew.terrain[r][c] > max_terrain:
+                    max_terrain = ew.terrain[r][c]
+
+        for r in range(min(grid_rows, ew.height)):
+            for c in range(min(grid_cols, ew.width)):
+                sc = c * 2
+                if sc + 1 >= max_w:
+                    break
+
+                water_level = ew.water[r][c]
+                terrain_h = ew.terrain[r][c]
+                norm_h = terrain_h / max_terrain
+
+                if water_level > 0.01:
+                    # Draw water
+                    if water_level > 0.05:
+                        ch = water_chars[2]
+                        cp = 100  # deep water (blue)
+                    elif water_level > 0.02:
+                        ch = water_chars[1]
+                        cp = 100  # blue
+                    else:
+                        ch = water_chars[0]
+                        cp = 101  # shallow (cyan)
+
+                    attr = curses.color_pair(cp) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+                else:
+                    # Draw terrain based on height
+                    # Check erosion intensity
+                    erosion_intensity = ew.erosion_map[r][c]
+
+                    if norm_h > 0.85:
+                        ch = height_chars[4]
+                        cp = 105  # white (peaks)
+                    elif norm_h > 0.65:
+                        ch = height_chars[3]
+                        cp = 104  # red (high)
+                    elif norm_h > 0.4:
+                        ch = height_chars[2]
+                        cp = 103  # yellow (mid)
+                    elif norm_h > 0.15:
+                        ch = height_chars[1]
+                        cp = 102  # green (low)
+                    else:
+                        continue  # very low terrain — skip
+
+                    # Show sediment deposition areas with magenta tint
+                    if erosion_intensity > 0.1:
+                        cp = 106  # magenta for heavily eroded
+
+                    attr = curses.color_pair(cp) if self.use_color else curses.A_DIM
+
+                try:
+                    self.stdscr.addstr(r, sc, ch, attr)
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            preset_name = EROSION_PRESET_NAMES[ew.preset_idx]
+            state_str = "RUNNING" if self.running else "PAUSED"
+            st = ew.stats
+            total_steps = self.erosion_gen * ew.steps_per_tick
+            status = (
+                f" Erosion | Gen: {self.erosion_gen} ({total_steps} steps) | "
+                f"Rain: {ew.rain_rate:.4f} | "
+                f"Water: {st['total_water']:.1f} Sed: {st['total_sediment']:.2f} | "
+                f"Peak: {st['max_height']:.2f} | "
+                f"Preset: {preset_name} | Speed: {self.speed} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset | "
+                "[P/N]Preset [+/-]Rain intensity [\\[/\\]]Steps/tick | "
+                "[F]aster [D]slower | [Shift+Y]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -7253,6 +7782,8 @@ class App:
             self._draw_wfc(max_h, max_w, grid_rows, grid_cols)
         elif self.turmite_mode:
             self._draw_turmite(max_h, max_w, grid_rows, grid_cols)
+        elif self.erosion_mode:
+            self._draw_erosion(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
