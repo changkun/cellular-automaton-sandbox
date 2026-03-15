@@ -3836,6 +3836,207 @@ class NBodyWorld:
 
 
 # ---------------------------------------------------------------------------
+# Abelian Sandpile simulation
+# ---------------------------------------------------------------------------
+
+SANDPILE_PRESETS = {
+    "center-drop": {
+        "desc": "Continuous drops at the center — classic sandpile",
+        "drop_mode": "center",
+        "threshold": 4,
+        "drops_per_tick": 1,
+        "init": "empty",
+    },
+    "random-rain": {
+        "desc": "Random grains falling across the grid",
+        "drop_mode": "random",
+        "threshold": 4,
+        "drops_per_tick": 3,
+        "init": "empty",
+    },
+    "identity": {
+        "desc": "Start from max and relax — beautiful fractal emerges",
+        "drop_mode": "none",
+        "threshold": 4,
+        "drops_per_tick": 0,
+        "init": "max",
+    },
+    "multi-source": {
+        "desc": "Four simultaneous drop points",
+        "drop_mode": "multi",
+        "threshold": 4,
+        "drops_per_tick": 1,
+        "init": "empty",
+    },
+    "high-threshold": {
+        "desc": "Threshold 8 — denser patterns, bigger avalanches",
+        "drop_mode": "center",
+        "threshold": 8,
+        "drops_per_tick": 2,
+        "init": "empty",
+    },
+}
+SANDPILE_PRESET_NAMES = list(SANDPILE_PRESETS.keys())
+
+
+class SandpileWorld:
+    """Abelian Sandpile model — self-organized criticality."""
+
+    def __init__(self, width: int, height: int, preset: str = "center-drop"):
+        self.width = width
+        self.height = height
+        self.preset_idx = SANDPILE_PRESET_NAMES.index(preset)
+        self.threshold = 4
+        self.drop_mode = "center"
+        self.drops_per_tick = 1
+        self.steps_per_tick = 1
+        self.grid = [[0] * width for _ in range(height)]
+        self.total_grains = 0
+        self.total_topplings = 0
+        self.avalanche_sizes: list[int] = []  # recent avalanche sizes
+        self.max_avalanche_history = 200
+        self.current_avalanche = 0
+        self._apply_preset(preset)
+
+    def _apply_preset(self, name: str) -> None:
+        cfg = SANDPILE_PRESETS[name]
+        self.threshold = cfg["threshold"]
+        self.drop_mode = cfg["drop_mode"]
+        self.drops_per_tick = cfg["drops_per_tick"]
+        self.grid = [[0] * self.width for _ in range(self.height)]
+        self.total_grains = 0
+        self.total_topplings = 0
+        self.avalanche_sizes = []
+        self.current_avalanche = 0
+        if cfg["init"] == "max":
+            # Fill every cell with 2 * threshold — will produce identity sandpile
+            fill_val = 2 * self.threshold
+            for r in range(self.height):
+                for c in range(self.width):
+                    self.grid[r][c] = fill_val
+                    self.total_grains += fill_val
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(SANDPILE_PRESET_NAMES)
+        name = SANDPILE_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def reset(self) -> None:
+        self._apply_preset(SANDPILE_PRESET_NAMES[self.preset_idx])
+
+    def drop_at(self, r: int, c: int) -> None:
+        """Drop a single grain at (r, c)."""
+        if 0 <= r < self.height and 0 <= c < self.width:
+            self.grid[r][c] += 1
+            self.total_grains += 1
+
+    def _drop_grains(self) -> None:
+        """Add grains according to the current drop mode."""
+        if self.drop_mode == "center":
+            cr, cc = self.height // 2, self.width // 2
+            for _ in range(self.drops_per_tick):
+                self.grid[cr][cc] += 1
+                self.total_grains += 1
+        elif self.drop_mode == "random":
+            import random as _rng
+            for _ in range(self.drops_per_tick):
+                r = _rng.randint(0, self.height - 1)
+                c = _rng.randint(0, self.width - 1)
+                self.grid[r][c] += 1
+                self.total_grains += 1
+        elif self.drop_mode == "multi":
+            h4, w4 = self.height // 4, self.width // 4
+            points = [
+                (h4, w4), (h4, 3 * w4),
+                (3 * h4, w4), (3 * h4, 3 * w4),
+            ]
+            for pr, pc in points:
+                for _ in range(self.drops_per_tick):
+                    self.grid[pr][pc] += 1
+                    self.total_grains += 1
+        # "none" — no drops (identity preset)
+
+    def _topple(self) -> int:
+        """Perform one full relaxation pass. Return total topplings."""
+        threshold = self.threshold
+        total = 0
+        changed = True
+        while changed:
+            changed = False
+            for r in range(self.height):
+                row = self.grid[r]
+                for c in range(self.width):
+                    if row[c] >= threshold:
+                        changed = True
+                        excess = row[c] // threshold
+                        row[c] -= excess * threshold
+                        total += excess
+                        # Distribute to neighbors; grains at edges fall off
+                        if r > 0:
+                            self.grid[r - 1][c] += excess
+                        else:
+                            self.total_grains -= excess
+                        if r < self.height - 1:
+                            self.grid[r + 1][c] += excess
+                        else:
+                            self.total_grains -= excess
+                        if c > 0:
+                            row[c - 1] += excess
+                        else:
+                            self.total_grains -= excess
+                        if c < self.width - 1:
+                            row[c + 1] += excess
+                        else:
+                            self.total_grains -= excess
+        return total
+
+    def tick(self) -> None:
+        for _ in range(self.steps_per_tick):
+            self._drop_grains()
+            topplings = self._topple()
+            self.total_topplings += topplings
+            if topplings > 0:
+                self.current_avalanche = topplings
+                self.avalanche_sizes.append(topplings)
+                if len(self.avalanche_sizes) > self.max_avalanche_history:
+                    self.avalanche_sizes.pop(0)
+            else:
+                self.current_avalanche = 0
+
+    @property
+    def stats(self) -> dict:
+        max_val = 0
+        for row in self.grid:
+            rm = max(row) if row else 0
+            if rm > max_val:
+                max_val = rm
+        avg_aval = 0.0
+        if self.avalanche_sizes:
+            avg_aval = sum(self.avalanche_sizes) / len(self.avalanche_sizes)
+        return {
+            "total_grains": self.total_grains,
+            "total_topplings": self.total_topplings,
+            "max_height": max_val,
+            "current_avalanche": self.current_avalanche,
+            "avg_avalanche": avg_aval,
+            "max_avalanche": max(self.avalanche_sizes) if self.avalanche_sizes else 0,
+        }
+
+    def sparkline(self, width: int = 30) -> str:
+        """Return a unicode sparkline of recent avalanche sizes."""
+        if not self.avalanche_sizes:
+            return ""
+        # Take last `width` entries
+        data = self.avalanche_sizes[-width:]
+        mx = max(data) if data else 1
+        if mx == 0:
+            mx = 1
+        bars = "▁▂▃▄▅▆▇█"
+        return "".join(bars[min(int(v / mx * (len(bars) - 1)), len(bars) - 1)] for v in data)
+
+
+# ---------------------------------------------------------------------------
 # Pattern detector — identifies known still lifes, oscillators, spaceships
 # ---------------------------------------------------------------------------
 
@@ -4427,6 +4628,11 @@ class App:
         self.nbody_world: NBodyWorld | None = None
         self.nbody_gen = 0
         self.nbody_preset_idx = 0
+        # Abelian Sandpile mode
+        self.sandpile_mode = False
+        self.sandpile_world: SandpileWorld | None = None
+        self.sandpile_gen = 0
+        self.sandpile_preset_idx = 0
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -4494,6 +4700,9 @@ class App:
             elif self.nbody_mode:
                 if self.running:
                     self._nbody_tick()
+            elif self.sandpile_mode:
+                if self.running:
+                    self._sandpile_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -4644,6 +4853,14 @@ class App:
             curses.init_pair(124, curses.COLOR_BLUE, -1)     # NBody: planet trail
             curses.init_pair(125, curses.COLOR_GREEN, -1)    # NBody: asteroid trail
             curses.init_pair(126, curses.COLOR_MAGENTA, -1)  # NBody: large star
+            # Abelian Sandpile mode color pairs
+            curses.init_pair(130, curses.COLOR_BLACK, -1)    # Sandpile: 0 grains
+            curses.init_pair(131, curses.COLOR_GREEN, -1)    # Sandpile: 1 grain
+            curses.init_pair(132, curses.COLOR_CYAN, -1)     # Sandpile: 2 grains
+            curses.init_pair(133, curses.COLOR_YELLOW, -1)   # Sandpile: 3 grains
+            curses.init_pair(134, curses.COLOR_RED, -1)      # Sandpile: toppling (>=threshold)
+            curses.init_pair(135, curses.COLOR_MAGENTA, -1)  # Sandpile: high pile
+            curses.init_pair(136, curses.COLOR_WHITE, -1)    # Sandpile: very high
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -4754,6 +4971,10 @@ class App:
         # N-Body gravity mode has its own input handler
         if self.nbody_mode:
             return self._handle_nbody_input(key)
+
+        # Abelian Sandpile mode has its own input handler
+        if self.sandpile_mode:
+            return self._handle_sandpile_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -4990,6 +5211,10 @@ class App:
         # Gravity N-Body simulation mode
         elif key == ord("K"):
             self._start_nbody()
+
+        # Abelian Sandpile simulation mode
+        elif key == ord("J"):
+            self._start_sandpile()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -8514,6 +8739,240 @@ class App:
             except curses.error:
                 pass
 
+    # --- Abelian Sandpile mode ---
+
+    def _handle_sandpile_input(self, key: int) -> bool:
+        """Handle input while in Abelian Sandpile mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            # Single step
+            self._sandpile_tick()
+        elif key == ord("r"):
+            if self.sandpile_world:
+                self.sandpile_world.reset()
+                self.sandpile_gen = 0
+                self._set_message("Sandpile reset")
+        elif key == ord("p"):
+            # Previous preset
+            if self.sandpile_world:
+                name = self.sandpile_world.cycle_preset(-1)
+                self.sandpile_preset_idx = self.sandpile_world.preset_idx
+                self.sandpile_gen = 0
+                self._set_message(f"Preset: {name}")
+        elif key == ord("n"):
+            # Next preset
+            if self.sandpile_world:
+                name = self.sandpile_world.cycle_preset(1)
+                self.sandpile_preset_idx = self.sandpile_world.preset_idx
+                self.sandpile_gen = 0
+                self._set_message(f"Preset: {name}")
+        elif key == ord("f"):
+            if self.sandpile_world:
+                self.sandpile_world.steps_per_tick = min(
+                    100, self.sandpile_world.steps_per_tick + 1
+                )
+                self._set_message(f"Steps/tick: {self.sandpile_world.steps_per_tick}")
+        elif key == ord("d"):
+            if self.sandpile_world:
+                self.sandpile_world.steps_per_tick = max(
+                    1, self.sandpile_world.steps_per_tick - 1
+                )
+                self._set_message(f"Steps/tick: {self.sandpile_world.steps_per_tick}")
+        elif key == ord("+") or key == ord("="):
+            # Increase threshold
+            if self.sandpile_world:
+                self.sandpile_world.threshold += 1
+                self._set_message(f"Threshold: {self.sandpile_world.threshold}")
+        elif key == ord("-"):
+            # Decrease threshold
+            if self.sandpile_world:
+                self.sandpile_world.threshold = max(2, self.sandpile_world.threshold - 1)
+                self._set_message(f"Threshold: {self.sandpile_world.threshold}")
+        elif key == ord("1"):
+            if self.sandpile_world:
+                self.sandpile_world.drop_mode = "center"
+                self._set_message("Drop mode: center")
+        elif key == ord("2"):
+            if self.sandpile_world:
+                self.sandpile_world.drop_mode = "random"
+                self._set_message("Drop mode: random")
+        elif key == ord("3"):
+            if self.sandpile_world:
+                self.sandpile_world.drop_mode = "multi"
+                self._set_message("Drop mode: multi")
+        elif key == ord("4"):
+            if self.sandpile_world:
+                self.sandpile_world.drop_mode = "none"
+                self._set_message("Drop mode: none (click to drop)")
+        elif key == ord("c"):
+            # Drop a big pile at center
+            if self.sandpile_world:
+                sw = self.sandpile_world
+                cr, cc = sw.height // 2, sw.width // 2
+                for _ in range(100):
+                    sw.drop_at(cr, cc)
+                self._set_message("Dropped 100 grains at center")
+        elif key == ord("J") or key == 27:  # Shift+J or ESC to exit
+            self._stop_sandpile()
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if self.sandpile_world and bstate & curses.BUTTON1_CLICKED:
+                    gc = mx // 2
+                    gr = my
+                    self.sandpile_world.drop_at(gr, gc)
+            except curses.error:
+                pass
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_sandpile(self) -> None:
+        """Enter Abelian Sandpile simulation mode."""
+        self.running = False
+        self.sandpile_mode = True
+        self.sandpile_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(4, max_w // 2)
+        h = max(4, max_h - 3)
+        preset = SANDPILE_PRESET_NAMES[self.sandpile_preset_idx]
+        self.sandpile_world = SandpileWorld(w, h, preset=preset)
+        try:
+            curses.mousemask(curses.BUTTON1_CLICKED)
+        except curses.error:
+            pass
+        self._set_message(
+            "Sandpile — [Space]Run [P/N]Preset [1-4]Drop mode [Shift+J]Exit"
+        )
+
+    def _stop_sandpile(self) -> None:
+        """Exit Abelian Sandpile simulation mode."""
+        self.sandpile_mode = False
+        self.running = False
+        self.sandpile_world = None
+        self.sandpile_gen = 0
+        self._set_message("Sandpile mode ended")
+
+    def _sandpile_tick(self) -> None:
+        """Advance one sandpile simulation step."""
+        if self.sandpile_world:
+            self.sandpile_world.tick()
+            self.sandpile_gen += 1
+
+    def _draw_sandpile(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the Abelian Sandpile simulation."""
+        if not self.sandpile_world:
+            return
+        sw = self.sandpile_world
+        threshold = sw.threshold
+
+        draw_h = min(grid_rows, sw.height)
+        draw_w = min(grid_cols, sw.width)
+
+        # Character and color lookup for grain counts
+        grain_chars = ["  ", "░░", "▒▒", "▓▓", "██"]
+        # Color pairs: 130=0, 131=1, 132=2, 133=3, 134=toppling, 135=high, 136=very high
+
+        for r in range(draw_h):
+            row = sw.grid[r]
+            for c in range(draw_w):
+                sc = c * 2
+                if sc + 1 >= max_w:
+                    break
+
+                val = row[c]
+                if val == 0:
+                    continue  # leave blank
+
+                # Pick character
+                if val < threshold:
+                    ci = min(val, len(grain_chars) - 1)
+                    ch = grain_chars[ci]
+                else:
+                    ch = "██"
+
+                # Pick color
+                if self.use_color:
+                    if val == 0:
+                        cp = 130
+                    elif val == 1:
+                        cp = 131
+                    elif val == 2:
+                        cp = 132
+                    elif val == 3:
+                        cp = 133
+                    elif val >= threshold:
+                        if val >= threshold * 2:
+                            cp = 136
+                        elif val >= threshold + 2:
+                            cp = 135
+                        else:
+                            cp = 134
+                    else:
+                        # For high thresholds, map values to gradient
+                        frac = val / max(threshold - 1, 1)
+                        if frac < 0.33:
+                            cp = 131
+                        elif frac < 0.66:
+                            cp = 132
+                        else:
+                            cp = 133
+
+                    attr = curses.color_pair(cp)
+                    if val >= threshold:
+                        attr |= curses.A_BOLD
+                else:
+                    attr = curses.A_NORMAL
+                    if val >= threshold:
+                        attr = curses.A_BOLD | curses.A_REVERSE
+
+                try:
+                    self.stdscr.addstr(r, sc, ch, attr)
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            preset_name = SANDPILE_PRESET_NAMES[sw.preset_idx]
+            state_str = "RUNNING" if self.running else "PAUSED"
+            st = sw.stats
+            sparkline = sw.sparkline(min(30, max(5, max_w // 6)))
+            status = (
+                f" Sandpile | Gen: {self.sandpile_gen} | "
+                f"Grains: {st['total_grains']} | Max: {st['max_height']} | "
+                f"Thresh: {threshold} | "
+                f"Aval: {st['current_avalanche']} (avg:{st['avg_avalanche']:.0f} max:{st['max_avalanche']}) | "
+                f"Drop: {sw.drop_mode} | "
+                f"{sparkline} | "
+                f"Preset: {preset_name} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset | "
+                "[P/N]Preset [1-4]DropMode [C]enter100 | "
+                "[+/-]Threshold [F]aster [D]slower | "
+                "[Click]Drop | [Shift+J]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -8869,6 +9328,8 @@ class App:
             self._draw_magfield(max_h, max_w, grid_rows, grid_cols)
         elif self.nbody_mode:
             self._draw_nbody(max_h, max_w, grid_rows, grid_cols)
+        elif self.sandpile_mode:
+            self._draw_sandpile(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
