@@ -83,6 +83,7 @@ class Grid:
         self.width = width
         self.height = height
         self.cells: set[tuple[int, int]] = set()
+        self.toroidal = False
 
     def tick(self) -> None:
         """Advance one generation using B3/S23 rules."""
@@ -93,8 +94,12 @@ class Grid:
                     if dr == 0 and dc == 0:
                         continue
                     nr, nc = r + dr, c + dc
-                    if 0 <= nr < self.height and 0 <= nc < self.width:
-                        neighbor_count[(nr, nc)] += 1
+                    if self.toroidal:
+                        nr %= self.height
+                        nc %= self.width
+                    elif not (0 <= nr < self.height and 0 <= nc < self.width):
+                        continue
+                    neighbor_count[(nr, nc)] += 1
         new_cells = set()
         for pos, count in neighbor_count.items():
             if count == 3 or (count == 2 and pos in self.cells):
@@ -145,6 +150,8 @@ class Grid:
 # ---------------------------------------------------------------------------
 
 class App:
+    HISTORY_MAX = 500  # max generations to keep in history
+
     def __init__(self, stdscr, width: int, height: int, filepath: str = "save.json"):
         self.stdscr = stdscr
         self.grid = Grid(width, height)
@@ -160,6 +167,9 @@ class App:
         # Viewport offset for scrolling
         self.view_r = 0
         self.view_c = 0
+        # History timeline: list of (generation, frozenset of cells)
+        self.history: list[tuple[int, frozenset[tuple[int, int]]]] = []
+        self.history_pos: int = -1  # -1 means live (not rewound)
 
     # --- main loop ---
 
@@ -172,7 +182,8 @@ class App:
         while True:
             if not self._handle_input():
                 break
-            if self.running:
+            if self.running and self.history_pos == -1:
+                self._record_history()
                 self.grid.tick()
                 self.generation += 1
             self._update_viewport()
@@ -218,7 +229,8 @@ class App:
 
         # Step
         elif key == ord("s"):
-            if not self.running:
+            if not self.running and self.history_pos == -1:
+                self._record_history()
                 self.grid.tick()
                 self.generation += 1
 
@@ -226,12 +238,16 @@ class App:
         elif key == ord("r"):
             self.grid.randomize()
             self.generation = 0
+            self.history.clear()
+            self.history_pos = -1
             self._set_message("Randomized")
 
         # Clear
         elif key == ord("c"):
             self.grid.clear()
             self.generation = 0
+            self.history.clear()
+            self.history_pos = -1
             self._set_message("Cleared")
 
         # Place cell or pattern
@@ -265,6 +281,18 @@ class App:
         elif key in (ord("-"), ord("_"), ord("[")):
             self.speed = max(1, self.speed - 1)
             self._update_timeout()
+
+        # Toroidal toggle
+        elif key == ord("t"):
+            self.grid.toroidal = not self.grid.toroidal
+            mode = "ON" if self.grid.toroidal else "OFF"
+            self._set_message(f"Toroidal wrapping {mode}")
+
+        # History rewind / fast-forward
+        elif key == ord(",") or key == ord("<"):
+            self._history_rewind()
+        elif key == ord(".") or key == ord(">"):
+            self._history_forward()
 
         # Save / Load
         elif key == ord("w"):
@@ -347,9 +375,13 @@ class App:
         status_y = max_h - 2
         if status_y > 0:
             state = "RUNNING" if self.running else "PAUSED"
+            topo = "Torus" if self.grid.toroidal else "Bounded"
+            hist_info = f"Hist: {len(self.history)}"
+            if self.history_pos != -1:
+                hist_info += f" @{self.history_pos}"
             status = (
                 f" Gen: {self.generation} | Cells: {len(self.grid.cells)} | "
-                f"Speed: {self.speed} | {state} "
+                f"Speed: {self.speed} | {topo} | {hist_info} | {state} "
             )
             if self.message_ttl > 0:
                 status += f"| {self.message} "
@@ -367,7 +399,7 @@ class App:
             help_text = (
                 f" [Space]Run [S]tep [R]and [C]lear [Q]uit | "
                 f"[P/N]Pattern: {pat_name} [Enter]Place [Esc]Desel | "
-                f"[+/-]Speed [W]Save [O]Load"
+                f"[+/-]Speed [T]orus [</>]Rewind/FF [W]Save [O]Load"
             )
             try:
                 self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
@@ -375,6 +407,59 @@ class App:
                 pass
 
         self.stdscr.refresh()
+
+    # --- history ---
+
+    def _record_history(self) -> None:
+        """Save current state to history before advancing."""
+        # If we rewound and then resumed, truncate future entries
+        if self.history_pos != -1:
+            self.history = self.history[: self.history_pos + 1]
+            self.history_pos = -1
+        self.history.append((self.generation, frozenset(self.grid.cells)))
+        if len(self.history) > self.HISTORY_MAX:
+            self.history.pop(0)
+
+    def _history_rewind(self) -> None:
+        """Step backward in history."""
+        if not self.history:
+            self._set_message("No history")
+            return
+        self.running = False
+        if self.history_pos == -1:
+            # Save current live state first
+            self.history.append((self.generation, frozenset(self.grid.cells)))
+            if len(self.history) > self.HISTORY_MAX + 1:
+                self.history.pop(0)
+            self.history_pos = len(self.history) - 2
+        elif self.history_pos > 0:
+            self.history_pos -= 1
+        else:
+            self._set_message("At oldest recorded generation")
+            return
+        gen, cells = self.history[self.history_pos]
+        self.generation = gen
+        self.grid.cells = set(cells)
+        self._set_message(f"Rewind to gen {gen}")
+
+    def _history_forward(self) -> None:
+        """Step forward in history."""
+        if self.history_pos == -1:
+            self._set_message("Already at latest")
+            return
+        self.history_pos += 1
+        if self.history_pos >= len(self.history):
+            self.history_pos = -1
+            self._set_message("Returned to live")
+        else:
+            gen, cells = self.history[self.history_pos]
+            self.generation = gen
+            self.grid.cells = set(cells)
+            if self.history_pos == len(self.history) - 1:
+                self.history_pos = -1
+                self._set_message("Returned to live")
+            else:
+                self._set_message(f"Forward to gen {gen}")
 
     # --- save / load ---
 
