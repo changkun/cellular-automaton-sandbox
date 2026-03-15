@@ -978,6 +978,208 @@ class ReactionDiffusionGrid:
 
 
 # ---------------------------------------------------------------------------
+# Wa-Tor Ecosystem — predator-prey simulation
+# ---------------------------------------------------------------------------
+
+# Cell states
+WATOR_EMPTY = 0
+WATOR_FISH = 1
+WATOR_SHARK = 2
+
+# Display characters
+WATOR_CHARS = {WATOR_EMPTY: " ", WATOR_FISH: ".", WATOR_SHARK: "#"}
+
+
+class WaTorWorld:
+    """Wa-Tor predator-prey ecosystem simulation.
+
+    A toroidal ocean grid populated by fish and sharks.
+    Fish breed after a set number of turns.  Sharks eat adjacent fish to
+    gain energy and starve if they cannot feed.  The result is emergent
+    Lotka-Volterra population oscillations visible in real-time.
+    """
+
+    def __init__(self, width: int, height: int,
+                 fish_breed: int = 3, shark_breed: int = 8,
+                 shark_starve: int = 4, initial_fish: int = 0,
+                 initial_sharks: int = 0):
+        self.width = width
+        self.height = height
+        self.fish_breed = fish_breed
+        self.shark_breed = shark_breed
+        self.shark_starve = shark_starve
+
+        # Grid stores cell type (EMPTY / FISH / SHARK)
+        self.grid: list[list[int]] = [[WATOR_EMPTY] * width for _ in range(height)]
+        # Age grid — turns survived (used for breeding)
+        self.age: list[list[int]] = [[0] * width for _ in range(height)]
+        # Energy grid — only meaningful for sharks
+        self.energy: list[list[int]] = [[0] * width for _ in range(height)]
+
+        # Population history for graphing
+        self.fish_history: list[int] = []
+        self.shark_history: list[int] = []
+
+        self.seed(initial_fish, initial_sharks)
+
+    def seed(self, n_fish: int = 0, n_sharks: int = 0) -> None:
+        """Populate the grid randomly with fish and sharks."""
+        w, h = self.width, self.height
+        total = w * h
+        if n_fish == 0:
+            n_fish = total // 4
+        if n_sharks == 0:
+            n_sharks = total // 16
+
+        # Clear
+        for r in range(h):
+            for c in range(w):
+                self.grid[r][c] = WATOR_EMPTY
+                self.age[r][c] = 0
+                self.energy[r][c] = 0
+
+        positions = list(range(total))
+        random.shuffle(positions)
+
+        for i in range(min(n_fish, total)):
+            r, c = divmod(positions[i], w)
+            self.grid[r][c] = WATOR_FISH
+            self.age[r][c] = random.randint(0, self.fish_breed - 1)
+
+        offset = min(n_fish, total)
+        for i in range(min(n_sharks, total - offset)):
+            r, c = divmod(positions[offset + i], w)
+            self.grid[r][c] = WATOR_SHARK
+            self.age[r][c] = random.randint(0, self.shark_breed - 1)
+            self.energy[r][c] = self.shark_starve
+
+        self.fish_history.clear()
+        self.shark_history.clear()
+
+    def _neighbors(self, r: int, c: int) -> list[tuple[int, int]]:
+        """Return the four toroidal neighbors in random order."""
+        ns = [
+            ((r - 1) % self.height, c),
+            ((r + 1) % self.height, c),
+            (r, (c - 1) % self.width),
+            (r, (c + 1) % self.width),
+        ]
+        random.shuffle(ns)
+        return ns
+
+    def tick(self) -> None:
+        """Advance the simulation by one chronon (time step)."""
+        w, h = self.width, self.height
+        moved: list[list[bool]] = [[False] * w for _ in range(h)]
+
+        # Process sharks first (they eat fish)
+        for r in range(h):
+            for c in range(w):
+                if self.grid[r][c] != WATOR_SHARK or moved[r][c]:
+                    continue
+                self.age[r][c] += 1
+                self.energy[r][c] -= 1
+
+                # Starve?
+                if self.energy[r][c] <= 0:
+                    self.grid[r][c] = WATOR_EMPTY
+                    self.age[r][c] = 0
+                    self.energy[r][c] = 0
+                    continue
+
+                # Look for adjacent fish to eat
+                neighbors = self._neighbors(r, c)
+                fish_n = [n for n in neighbors if self.grid[n[0]][n[1]] == WATOR_FISH]
+                empty_n = [n for n in neighbors if self.grid[n[0]][n[1]] == WATOR_EMPTY]
+
+                if fish_n:
+                    nr, nc = fish_n[0]
+                    # Eat the fish
+                    self.energy[r][c] += self.shark_starve  # regain energy
+                    # Move to fish cell
+                    self.grid[nr][nc] = WATOR_SHARK
+                    self.age[nr][nc] = self.age[r][c]
+                    self.energy[nr][nc] = self.energy[r][c]
+                    moved[nr][nc] = True
+                    # Breed?
+                    if self.age[r][c] >= self.shark_breed:
+                        self.grid[r][c] = WATOR_SHARK
+                        self.age[r][c] = 0
+                        self.energy[r][c] = self.shark_starve
+                        self.age[nr][nc] = 0
+                    else:
+                        self.grid[r][c] = WATOR_EMPTY
+                        self.age[r][c] = 0
+                        self.energy[r][c] = 0
+                elif empty_n:
+                    nr, nc = empty_n[0]
+                    self.grid[nr][nc] = WATOR_SHARK
+                    self.age[nr][nc] = self.age[r][c]
+                    self.energy[nr][nc] = self.energy[r][c]
+                    moved[nr][nc] = True
+                    if self.age[r][c] >= self.shark_breed:
+                        self.grid[r][c] = WATOR_SHARK
+                        self.age[r][c] = 0
+                        self.energy[r][c] = self.shark_starve
+                        self.age[nr][nc] = 0
+                    else:
+                        self.grid[r][c] = WATOR_EMPTY
+                        self.age[r][c] = 0
+                        self.energy[r][c] = 0
+
+        # Process fish
+        for r in range(h):
+            for c in range(w):
+                if self.grid[r][c] != WATOR_FISH or moved[r][c]:
+                    continue
+                self.age[r][c] += 1
+                neighbors = self._neighbors(r, c)
+                empty_n = [n for n in neighbors if self.grid[n[0]][n[1]] == WATOR_EMPTY]
+
+                if empty_n:
+                    nr, nc = empty_n[0]
+                    self.grid[nr][nc] = WATOR_FISH
+                    self.age[nr][nc] = self.age[r][c]
+                    moved[nr][nc] = True
+                    if self.age[r][c] >= self.fish_breed:
+                        # Breed — leave a new fish behind
+                        self.grid[r][c] = WATOR_FISH
+                        self.age[r][c] = 0
+                        self.age[nr][nc] = 0
+                    else:
+                        self.grid[r][c] = WATOR_EMPTY
+                        self.age[r][c] = 0
+
+        # Record population
+        fish_count = 0
+        shark_count = 0
+        for r in range(h):
+            for c in range(w):
+                if self.grid[r][c] == WATOR_FISH:
+                    fish_count += 1
+                elif self.grid[r][c] == WATOR_SHARK:
+                    shark_count += 1
+        self.fish_history.append(fish_count)
+        self.shark_history.append(shark_count)
+        # Keep history bounded
+        max_hist = 200
+        if len(self.fish_history) > max_hist:
+            self.fish_history = self.fish_history[-max_hist:]
+            self.shark_history = self.shark_history[-max_hist:]
+
+    def population(self) -> tuple[int, int]:
+        """Return (fish_count, shark_count)."""
+        fish = shark = 0
+        for r in range(self.height):
+            for c in range(self.width):
+                if self.grid[r][c] == WATOR_FISH:
+                    fish += 1
+                elif self.grid[r][c] == WATOR_SHARK:
+                    shark += 1
+        return fish, shark
+
+
+# ---------------------------------------------------------------------------
 # Particle Life — continuous-space particle simulation
 # ---------------------------------------------------------------------------
 
@@ -1785,6 +1987,10 @@ class App:
         self.pl_mode = False
         self.pl_world: ParticleLifeWorld | None = None
         self.pl_gen = 0
+        # Wa-Tor Ecosystem mode
+        self.eco_mode = False
+        self.eco_world: WaTorWorld | None = None
+        self.eco_gen = 0
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -1819,6 +2025,9 @@ class App:
             elif self.pl_mode:
                 if self.running:
                     self._pl_tick()
+            elif self.eco_mode:
+                if self.running:
+                    self._eco_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -1898,6 +2107,9 @@ class App:
             curses.init_pair(42, curses.COLOR_YELLOW, -1)   # PL: type 3 Yellow
             curses.init_pair(43, curses.COLOR_CYAN, -1)     # PL: type 4 Cyan
             curses.init_pair(44, curses.COLOR_MAGENTA, -1)  # PL: type 5 Magenta
+            # Wa-Tor Ecosystem colors
+            curses.init_pair(45, curses.COLOR_GREEN, -1)   # Fish
+            curses.init_pair(46, curses.COLOR_RED, -1)     # Shark
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -1964,6 +2176,10 @@ class App:
         # Particle Life mode has its own input handler
         if self.pl_mode:
             return self._handle_pl_input(key)
+
+        # Wa-Tor Ecosystem mode has its own input handler
+        if self.eco_mode:
+            return self._handle_eco_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -2156,6 +2372,10 @@ class App:
         # Particle Life mode
         elif key == ord("P"):
             self._start_pl()
+
+        # Ecosystem (Wa-Tor) mode
+        elif key == ord("E"):
+            self._start_eco()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -3423,6 +3643,181 @@ class App:
             except curses.error:
                 pass
 
+    # --- Wa-Tor Ecosystem mode ---
+
+    def _handle_eco_input(self, key: int) -> bool:
+        """Handle input while in ecosystem mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            if not self.running:
+                self._eco_tick()
+        elif key == ord("r"):
+            if self.eco_world:
+                self.eco_world.seed()
+                self.eco_gen = 0
+                self._set_message("Ocean repopulated")
+        elif key == ord("c"):
+            if self.eco_world:
+                self.eco_world.seed()
+                self.eco_gen = 0
+                self._set_message("Cleared & reset")
+        # Adjust fish breed time
+        elif key == ord("]") or key == ord("+") or key == ord("="):
+            if self.eco_world:
+                self.eco_world.fish_breed = min(20, self.eco_world.fish_breed + 1)
+                self._set_message(f"Fish breed: {self.eco_world.fish_breed}")
+        elif key == ord("[") or key == ord("-") or key == ord("_"):
+            if self.eco_world:
+                self.eco_world.fish_breed = max(1, self.eco_world.fish_breed - 1)
+                self._set_message(f"Fish breed: {self.eco_world.fish_breed}")
+        # Adjust shark breed time
+        elif key == ord("b"):
+            if self.eco_world:
+                self.eco_world.shark_breed = min(30, self.eco_world.shark_breed + 1)
+                self._set_message(f"Shark breed: {self.eco_world.shark_breed}")
+        elif key == ord("n"):
+            if self.eco_world:
+                self.eco_world.shark_breed = max(1, self.eco_world.shark_breed - 1)
+                self._set_message(f"Shark breed: {self.eco_world.shark_breed}")
+        # Adjust shark starve time
+        elif key == ord("f"):
+            if self.eco_world:
+                self.eco_world.shark_starve = min(20, self.eco_world.shark_starve + 1)
+                self._set_message(f"Shark starve: {self.eco_world.shark_starve}")
+        elif key == ord("g"):
+            if self.eco_world:
+                self.eco_world.shark_starve = max(1, self.eco_world.shark_starve - 1)
+                self._set_message(f"Shark starve: {self.eco_world.shark_starve}")
+        # Speed control
+        elif key == ord(">"):
+            self.speed = min(20, self.speed + 1)
+            self._update_timeout()
+        elif key == ord("<"):
+            self.speed = max(1, self.speed - 1)
+            self._update_timeout()
+        # Exit ecosystem mode
+        elif key == ord("E") or key == 27:
+            self._stop_eco()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_eco(self) -> None:
+        """Enter ecosystem (Wa-Tor) mode."""
+        self.running = False
+        self.eco_mode = True
+        self.eco_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(1, max_w - 1)
+        h = max(1, max_h - 3)
+        self.eco_world = WaTorWorld(w, h)
+        self._set_message(
+            "Wa-Tor Ecosystem — [Space]Run [S]tep [R]eset [E]xit"
+        )
+
+    def _stop_eco(self) -> None:
+        """Exit ecosystem mode."""
+        self.eco_mode = False
+        self.running = False
+        self.eco_world = None
+        self.eco_gen = 0
+        self._set_message("Ecosystem mode ended")
+
+    def _eco_tick(self) -> None:
+        """Advance one ecosystem generation."""
+        if self.eco_world:
+            self.eco_world.tick()
+            self.eco_gen += 1
+
+    def _draw_eco(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the Wa-Tor ecosystem world."""
+        if not self.eco_world:
+            return
+        ew = self.eco_world
+
+        # Draw grid
+        for r in range(min(grid_rows, ew.height)):
+            line_parts: list[tuple[str, int]] = []
+            for c in range(min(max_w - 1, ew.width)):
+                cell = ew.grid[r][c]
+                if cell == WATOR_FISH:
+                    ch = WATOR_CHARS[WATOR_FISH]
+                    attr = curses.color_pair(45) if self.use_color else 0
+                elif cell == WATOR_SHARK:
+                    ch = WATOR_CHARS[WATOR_SHARK]
+                    attr = curses.color_pair(46) | curses.A_BOLD if self.use_color else curses.A_BOLD
+                else:
+                    ch = " "
+                    attr = 0
+                try:
+                    self.stdscr.addstr(r, c, ch, attr)
+                except curses.error:
+                    pass
+
+        # Population graph (sparkline in the rightmost columns)
+        graph_w = min(40, max_w // 4)
+        graph_x = max_w - graph_w - 1
+        if graph_x > 10 and len(ew.fish_history) > 1:
+            # Normalize histories to fit in grid_rows
+            fish_h = ew.fish_history[-graph_w:]
+            shark_h = ew.shark_history[-graph_w:]
+            max_pop = max(max(fish_h, default=1), max(shark_h, default=1), 1)
+            for i, (fp, sp) in enumerate(zip(fish_h, shark_h)):
+                col = graph_x + i
+                if col >= max_w - 1:
+                    break
+                fish_row = grid_rows - 1 - int((fp / max_pop) * (grid_rows - 1))
+                shark_row = grid_rows - 1 - int((sp / max_pop) * (grid_rows - 1))
+                fish_row = max(0, min(grid_rows - 1, fish_row))
+                shark_row = max(0, min(grid_rows - 1, shark_row))
+                try:
+                    self.stdscr.addstr(
+                        fish_row, col, ".",
+                        curses.color_pair(45) if self.use_color else 0
+                    )
+                    self.stdscr.addstr(
+                        shark_row, col, "x",
+                        curses.color_pair(46) if self.use_color else 0
+                    )
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            fish_count, shark_count = ew.population()
+            state_str = "RUNNING" if self.running else "PAUSED"
+            status = (
+                f" Wa-Tor | Gen: {self.eco_gen} | "
+                f"Fish: {fish_count} Sharks: {shark_count} | "
+                f"Breed F:{ew.fish_breed} S:{ew.shark_breed} "
+                f"Starve:{ew.shark_starve} | "
+                f"Speed: {self.speed} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset [C]lear | "
+                "[+/-]FishBreed [B/N]SharkBreed [F/G]Starve [</>]Spd | [E]xit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -3756,6 +4151,8 @@ class App:
             self._draw_rd(max_h, max_w, grid_rows, grid_cols)
         elif self.pl_mode:
             self._draw_pl(max_h, max_w, grid_rows, grid_cols)
+        elif self.eco_mode:
+            self._draw_eco(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
