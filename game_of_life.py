@@ -1915,6 +1915,213 @@ class FluidWorld:
 
 # Presets: (temperature, coupling_J, description)
 # Critical temperature for 2D Ising: Tc = 2J / ln(1+sqrt(2)) ≈ 2.269 for J=1
+# ---------------------------------------------------------------------------
+# Boids flocking simulation
+# ---------------------------------------------------------------------------
+
+BOIDS_PRESETS = {
+    "classic":    (0.02, 0.05, 0.005, 2.0, 4.0, 8.0, "Classic Reynolds flocking"),
+    "tight":      (0.04, 0.08, 0.008, 1.5, 3.0, 6.0, "Tight cohesive flocks"),
+    "loose":      (0.01, 0.03, 0.003, 3.0, 6.0, 12.0, "Loose swarm behavior"),
+    "predator":   (0.05, 0.10, 0.002, 2.5, 5.0, 10.0, "Strong separation, weak cohesion"),
+    "murmur":     (0.02, 0.12, 0.010, 2.0, 5.0, 10.0, "Starling murmuration-like"),
+    "school":     (0.03, 0.06, 0.010, 1.5, 3.5, 7.0, "Fish schooling behavior"),
+}
+BOIDS_PRESET_NAMES = list(BOIDS_PRESETS.keys())
+
+# Direction arrows for rendering boids based on heading
+BOIDS_ARROWS = "→↗↑↖←↙↓↘"
+
+
+class BoidsWorld:
+    """Craig Reynolds' Boids flocking simulation.
+
+    Each boid follows three simple rules:
+    1. Separation: steer away from nearby boids to avoid crowding
+    2. Alignment: steer towards average heading of nearby boids
+    3. Cohesion: steer towards average position of nearby boids
+
+    These produce emergent flocking, schooling, and swarming behavior.
+    """
+
+    def __init__(self, width: int, height: int, num_boids: int = 150,
+                 preset: str = "classic"):
+        self.width = width
+        self.height = height
+        self.num_boids = num_boids
+        self.preset_idx = BOIDS_PRESET_NAMES.index(preset)
+
+        # Per-boid state: x, y, vx, vy
+        self.x: list[float] = []
+        self.y: list[float] = []
+        self.vx: list[float] = []
+        self.vy: list[float] = []
+
+        # Max speed
+        self.max_speed = 1.5
+        self.min_speed = 0.3
+
+        # Rule weights (set by preset)
+        self.sep_weight = 0.02
+        self.ali_weight = 0.05
+        self.coh_weight = 0.005
+
+        # Perception radii
+        self.sep_radius = 2.0
+        self.ali_radius = 4.0
+        self.coh_radius = 8.0
+
+        self._apply_preset(preset)
+        self.seed()
+
+    def _apply_preset(self, name: str) -> None:
+        if name not in BOIDS_PRESETS:
+            name = "classic"
+        sep_w, ali_w, coh_w, sep_r, ali_r, coh_r, _desc = BOIDS_PRESETS[name]
+        self.sep_weight = sep_w
+        self.ali_weight = ali_w
+        self.coh_weight = coh_w
+        self.sep_radius = sep_r
+        self.ali_radius = ali_r
+        self.coh_radius = coh_r
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(BOIDS_PRESET_NAMES)
+        name = BOIDS_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def seed(self) -> None:
+        """Initialize boids with random positions and velocities."""
+        self.x = [random.uniform(0, self.width) for _ in range(self.num_boids)]
+        self.y = [random.uniform(0, self.height) for _ in range(self.num_boids)]
+        self.vx = [random.uniform(-1, 1) for _ in range(self.num_boids)]
+        self.vy = [random.uniform(-1, 1) for _ in range(self.num_boids)]
+        # Normalize initial velocities
+        for i in range(self.num_boids):
+            speed = math.sqrt(self.vx[i] ** 2 + self.vy[i] ** 2)
+            if speed > 0:
+                self.vx[i] = self.vx[i] / speed * self.max_speed * 0.5
+                self.vy[i] = self.vy[i] / speed * self.max_speed * 0.5
+
+    def set_num_boids(self, n: int) -> None:
+        """Change number of boids, adding or removing as needed."""
+        n = max(5, min(1000, n))
+        while len(self.x) < n:
+            self.x.append(random.uniform(0, self.width))
+            self.y.append(random.uniform(0, self.height))
+            self.vx.append(random.uniform(-1, 1))
+            self.vy.append(random.uniform(-1, 1))
+        if len(self.x) > n:
+            self.x = self.x[:n]
+            self.y = self.y[:n]
+            self.vx = self.vx[:n]
+            self.vy = self.vy[:n]
+        self.num_boids = n
+
+    def tick(self) -> None:
+        """Advance simulation by one time step."""
+        n = self.num_boids
+        w, h = float(self.width), float(self.height)
+        sep_r2 = self.sep_radius ** 2
+        ali_r2 = self.ali_radius ** 2
+        coh_r2 = self.coh_radius ** 2
+        max_r2 = max(sep_r2, ali_r2, coh_r2)
+
+        new_vx = list(self.vx)
+        new_vy = list(self.vy)
+
+        for i in range(n):
+            # Separation accumulators
+            sep_dx = 0.0
+            sep_dy = 0.0
+            sep_count = 0
+            # Alignment accumulators
+            ali_vx = 0.0
+            ali_vy = 0.0
+            ali_count = 0
+            # Cohesion accumulators
+            coh_x = 0.0
+            coh_y = 0.0
+            coh_count = 0
+
+            xi, yi = self.x[i], self.y[i]
+
+            for j in range(n):
+                if i == j:
+                    continue
+                # Toroidal distance
+                dx = self.x[j] - xi
+                dy = self.y[j] - yi
+                # Wrap around
+                if dx > w * 0.5:
+                    dx -= w
+                elif dx < -w * 0.5:
+                    dx += w
+                if dy > h * 0.5:
+                    dy -= h
+                elif dy < -h * 0.5:
+                    dy += h
+
+                dist2 = dx * dx + dy * dy
+                if dist2 > max_r2 or dist2 < 1e-9:
+                    continue
+
+                # Separation
+                if dist2 < sep_r2:
+                    # Steer away, weighted by inverse distance
+                    sep_dx -= dx / dist2
+                    sep_dy -= dy / dist2
+                    sep_count += 1
+
+                # Alignment
+                if dist2 < ali_r2:
+                    ali_vx += self.vx[j]
+                    ali_vy += self.vy[j]
+                    ali_count += 1
+
+                # Cohesion
+                if dist2 < coh_r2:
+                    coh_x += dx  # relative position
+                    coh_y += dy
+                    coh_count += 1
+
+            # Apply forces
+            if sep_count > 0:
+                new_vx[i] += sep_dx * self.sep_weight
+                new_vy[i] += sep_dy * self.sep_weight
+
+            if ali_count > 0:
+                avg_vx = ali_vx / ali_count
+                avg_vy = ali_vy / ali_count
+                new_vx[i] += (avg_vx - self.vx[i]) * self.ali_weight
+                new_vy[i] += (avg_vy - self.vy[i]) * self.ali_weight
+
+            if coh_count > 0:
+                avg_dx = coh_x / coh_count
+                avg_dy = coh_y / coh_count
+                new_vx[i] += avg_dx * self.coh_weight
+                new_vy[i] += avg_dy * self.coh_weight
+
+        # Update velocities and positions
+        for i in range(n):
+            self.vx[i] = new_vx[i]
+            self.vy[i] = new_vy[i]
+
+            # Clamp speed
+            speed = math.sqrt(self.vx[i] ** 2 + self.vy[i] ** 2)
+            if speed > self.max_speed:
+                self.vx[i] = self.vx[i] / speed * self.max_speed
+                self.vy[i] = self.vy[i] / speed * self.max_speed
+            elif speed < self.min_speed and speed > 1e-9:
+                self.vx[i] = self.vx[i] / speed * self.min_speed
+                self.vy[i] = self.vy[i] / speed * self.min_speed
+
+            # Move
+            self.x[i] = (self.x[i] + self.vx[i]) % w
+            self.y[i] = (self.y[i] + self.vy[i]) % h
+
+
 ISING_PRESETS = {
     "cold":       (0.5,  1.0, "Deep ferromagnetic — highly ordered"),
     "cool":       (1.5,  1.0, "Below critical — large domains"),
@@ -2613,6 +2820,11 @@ class App:
         self.ising_world: IsingWorld | None = None
         self.ising_gen = 0
         self.ising_preset_idx = 0
+        # Boids flocking simulation mode
+        self.boids_mode = False
+        self.boids_world: BoidsWorld | None = None
+        self.boids_gen = 0
+        self.boids_preset_idx = 0
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -2659,6 +2871,9 @@ class App:
             elif self.ising_mode:
                 if self.running:
                     self._ising_tick()
+            elif self.boids_mode:
+                if self.running:
+                    self._boids_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -2758,6 +2973,12 @@ class App:
             # Ising Model spin colors
             curses.init_pair(59, curses.COLOR_CYAN, -1)    # Ising: spin up (+1)
             curses.init_pair(60, curses.COLOR_RED, -1)     # Ising: spin down (-1)
+            # Boids flocking colors (direction-based)
+            curses.init_pair(61, curses.COLOR_CYAN, -1)    # Boids: default
+            curses.init_pair(62, curses.COLOR_GREEN, -1)   # Boids: heading right
+            curses.init_pair(63, curses.COLOR_YELLOW, -1)  # Boids: heading up
+            curses.init_pair(64, curses.COLOR_RED, -1)     # Boids: heading left
+            curses.init_pair(65, curses.COLOR_MAGENTA, -1) # Boids: heading down
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -2840,6 +3061,10 @@ class App:
         # Ising Model mode has its own input handler
         if self.ising_mode:
             return self._handle_ising_input(key)
+
+        # Boids flocking mode has its own input handler
+        if self.boids_mode:
+            return self._handle_boids_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -3048,6 +3273,10 @@ class App:
         # Ising Model (statistical mechanics) mode
         elif key == ord("I"):
             self._start_ising()
+
+        # Boids flocking simulation mode
+        elif key == ord("B"):
+            self._start_boids()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -5131,6 +5360,180 @@ class App:
             except curses.error:
                 pass
 
+    # --- Boids flocking simulation ---
+
+    def _handle_boids_input(self, key: int) -> bool:
+        """Handle input while in Boids flocking mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            if not self.running:
+                self._boids_tick()
+        elif key == ord("r"):
+            if self.boids_world:
+                self.boids_world.seed()
+                self.boids_gen = 0
+                self._set_message("Reset boids")
+        # Cycle presets
+        elif key == ord("p") or key == ord("n"):
+            if self.boids_world:
+                direction = 1 if key == ord("n") else -1
+                name = self.boids_world.cycle_preset(direction)
+                self.boids_preset_idx = self.boids_world.preset_idx
+                self._set_message(f"Preset: {name}")
+        # Adjust boid count
+        elif key == ord("]"):
+            if self.boids_world:
+                self.boids_world.set_num_boids(self.boids_world.num_boids + 25)
+                self._set_message(f"Boids: {self.boids_world.num_boids}")
+        elif key == ord("["):
+            if self.boids_world:
+                self.boids_world.set_num_boids(self.boids_world.num_boids - 25)
+                self._set_message(f"Boids: {self.boids_world.num_boids}")
+        # Adjust separation weight
+        elif key == ord("1"):
+            if self.boids_world:
+                self.boids_world.sep_weight = max(0.0, self.boids_world.sep_weight - 0.005)
+                self._set_message(f"Separation: {self.boids_world.sep_weight:.3f}")
+        elif key == ord("!"):
+            if self.boids_world:
+                self.boids_world.sep_weight = min(0.2, self.boids_world.sep_weight + 0.005)
+                self._set_message(f"Separation: {self.boids_world.sep_weight:.3f}")
+        # Adjust alignment weight
+        elif key == ord("2"):
+            if self.boids_world:
+                self.boids_world.ali_weight = max(0.0, self.boids_world.ali_weight - 0.005)
+                self._set_message(f"Alignment: {self.boids_world.ali_weight:.3f}")
+        elif key == ord("@"):
+            if self.boids_world:
+                self.boids_world.ali_weight = min(0.3, self.boids_world.ali_weight + 0.005)
+                self._set_message(f"Alignment: {self.boids_world.ali_weight:.3f}")
+        # Adjust cohesion weight
+        elif key == ord("3"):
+            if self.boids_world:
+                self.boids_world.coh_weight = max(0.0, self.boids_world.coh_weight - 0.002)
+                self._set_message(f"Cohesion: {self.boids_world.coh_weight:.3f}")
+        elif key == ord("#"):
+            if self.boids_world:
+                self.boids_world.coh_weight = min(0.1, self.boids_world.coh_weight + 0.002)
+                self._set_message(f"Cohesion: {self.boids_world.coh_weight:.3f}")
+        # Speed control
+        elif key == ord("f"):
+            self.speed = min(20, self.speed + 1)
+            self._update_timeout()
+        elif key == ord("d"):
+            self.speed = max(1, self.speed - 1)
+            self._update_timeout()
+        # Exit Boids mode
+        elif key == ord("B") or key == 27:
+            self._stop_boids()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_boids(self) -> None:
+        """Enter Boids flocking mode."""
+        self.running = False
+        self.boids_mode = True
+        self.boids_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(10, max_w)
+        h = max(10, max_h - 3)
+        preset = BOIDS_PRESET_NAMES[self.boids_preset_idx]
+        self.boids_world = BoidsWorld(w, h, preset=preset)
+        self._set_message(
+            "Boids Flocking — [Space]Run [P/N]Preset [Shift+B]Exit"
+        )
+
+    def _stop_boids(self) -> None:
+        """Exit Boids flocking mode."""
+        self.boids_mode = False
+        self.running = False
+        self.boids_world = None
+        self.boids_gen = 0
+        self._set_message("Boids mode ended")
+
+    def _boids_tick(self) -> None:
+        """Advance one Boids generation."""
+        if self.boids_world:
+            self.boids_world.tick()
+            self.boids_gen += 1
+
+    def _draw_boids(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the Boids flocking simulation."""
+        if not self.boids_world:
+            return
+        bw = self.boids_world
+
+        # Clear the grid area (boids are sparse)
+        # Render each boid as a directional arrow
+        for i in range(bw.num_boids):
+            # Map continuous position to screen coordinates
+            sc = int(bw.x[i]) % max_w
+            sr = int(bw.y[i]) % grid_rows
+
+            if sr < 0 or sr >= grid_rows or sc < 0 or sc >= max_w - 1:
+                continue
+
+            # Determine heading direction (8 directions)
+            angle = math.atan2(-bw.vy[i], bw.vx[i])  # negative vy because screen y is inverted
+            # Map angle to 0-7 index (0=right, going counterclockwise)
+            idx = int((angle + math.pi) / (2 * math.pi) * 8 + 0.5) % 8
+            ch = BOIDS_ARROWS[idx]
+
+            # Color based on heading quadrant
+            if self.use_color:
+                if idx in (0, 1, 7):      # rightward
+                    attr = curses.color_pair(62) | curses.A_BOLD
+                elif idx in (2, 3):        # upward
+                    attr = curses.color_pair(63) | curses.A_BOLD
+                elif idx in (4, 5):        # leftward
+                    attr = curses.color_pair(64) | curses.A_BOLD
+                else:                      # downward
+                    attr = curses.color_pair(65) | curses.A_BOLD
+            else:
+                attr = curses.A_BOLD
+
+            try:
+                self.stdscr.addstr(sr, sc, ch, attr)
+            except curses.error:
+                pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            preset_name = BOIDS_PRESET_NAMES[bw.preset_idx]
+            state_str = "RUNNING" if self.running else "PAUSED"
+            status = (
+                f" Boids | Gen: {self.boids_gen} | "
+                f"N={bw.num_boids} | "
+                f"Sep={bw.sep_weight:.3f} Ali={bw.ali_weight:.3f} Coh={bw.coh_weight:.3f} | "
+                f"Preset: {preset_name} | Speed: {self.speed} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset | "
+                "[1/!]Sep [2/@]Ali [3/#]Coh [[]Boids | "
+                "[P/N]Preset [F]aster [D]slower | [Shift+B]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -5472,6 +5875,8 @@ class App:
             self._draw_fluid(max_h, max_w, grid_rows, grid_cols)
         elif self.ising_mode:
             self._draw_ising(max_h, max_w, grid_rows, grid_cols)
+        elif self.boids_mode:
+            self._draw_boids(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
