@@ -1656,6 +1656,260 @@ class PhysarumWorld:
 
 
 # ---------------------------------------------------------------------------
+# Fluid Dynamics — Lattice Boltzmann Method (D2Q9)
+# ---------------------------------------------------------------------------
+
+# Presets: (viscosity, inlet_velocity, description)
+FLUID_PRESETS = {
+    "laminar": (0.08, 0.08, "Smooth laminar flow"),
+    "moderate": (0.04, 0.12, "Moderate Reynolds number"),
+    "turbulent": (0.02, 0.15, "Turbulent vortex streets"),
+    "viscous": (0.15, 0.06, "High viscosity, slow flow"),
+    "fast": (0.01, 0.18, "Fast flow, chaotic vortices"),
+}
+FLUID_PRESET_NAMES = list(FLUID_PRESETS.keys())
+
+# Rendering characters for fluid (velocity magnitude)
+FLUID_SHADES = " ·:░▒▓█"
+
+
+class FluidWorld:
+    """Lattice Boltzmann Method (D2Q9) fluid dynamics simulation.
+
+    Simulates 2D incompressible fluid on a lattice.  Users can place solid
+    obstacles and watch vortex streets, eddies, and laminar-to-turbulent
+    flow emerge in real time.
+
+    The D2Q9 model uses 9 velocity directions per lattice node.  Each
+    tick performs: streaming → boundary conditions → collision (BGK).
+    """
+
+    # D2Q9 lattice velocities (cx, cy) and weights
+    #   0: rest, 1-4: cardinal, 5-8: diagonal
+    CX = [0, 1, 0, -1, 0, 1, -1, -1, 1]
+    CY = [0, 0, 1, 0, -1, 1, 1, -1, -1]
+    W = [4/9, 1/9, 1/9, 1/9, 1/9, 1/36, 1/36, 1/36, 1/36]
+    # Opposite direction index (for bounce-back)
+    OPP = [0, 3, 4, 1, 2, 7, 8, 5, 6]
+
+    def __init__(self, width: int, height: int, preset: str = "moderate"):
+        self.width = width
+        self.height = height
+        self.preset_idx = FLUID_PRESET_NAMES.index(preset)
+
+        # Obstacle mask: True = solid wall
+        self.obstacle: list[list[bool]] = [[False] * width for _ in range(height)]
+
+        # Distribution functions: f[i][y][x] for direction i
+        self.f: list[list[list[float]]] = [
+            [[0.0] * width for _ in range(height)] for _ in range(9)
+        ]
+
+        # Macroscopic fields (cached for rendering)
+        self.rho: list[list[float]] = [[1.0] * width for _ in range(height)]
+        self.ux: list[list[float]] = [[0.0] * width for _ in range(height)]
+        self.uy: list[list[float]] = [[0.0] * width for _ in range(height)]
+
+        # Parameters
+        self._apply_preset(preset)
+
+        # Initialize equilibrium distribution
+        self._init_equilibrium()
+
+        # Place default obstacle (cylinder in center)
+        self._place_default_obstacle()
+
+    def _apply_preset(self, name: str) -> None:
+        visc, vel, _desc = FLUID_PRESETS[name]
+        self.viscosity = visc
+        self.inlet_velocity = vel
+        # BGK relaxation parameter: tau = 3*nu + 0.5
+        self.tau = 3.0 * self.viscosity + 0.5
+        self.omega = 1.0 / self.tau
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(FLUID_PRESET_NAMES)
+        name = FLUID_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def _init_equilibrium(self) -> None:
+        """Initialize all nodes to equilibrium at rest density with inlet velocity."""
+        u0 = self.inlet_velocity
+        for y in range(self.height):
+            for x in range(self.width):
+                for i in range(9):
+                    cu = self.CX[i] * u0 + self.CY[i] * 0.0
+                    usq = u0 * u0
+                    self.f[i][y][x] = self.W[i] * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * usq)
+                self.ux[y][x] = u0
+                self.uy[y][x] = 0.0
+                self.rho[y][x] = 1.0
+
+    def _place_default_obstacle(self) -> None:
+        """Place a circular obstacle in the left-center of the domain."""
+        cx = self.width // 5
+        cy = self.height // 2
+        radius = max(2, min(self.width, self.height) // 8)
+        r2 = radius * radius
+        for y in range(self.height):
+            for x in range(self.width):
+                if (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r2:
+                    self.obstacle[y][x] = True
+
+    def clear_obstacles(self) -> None:
+        for y in range(self.height):
+            for x in range(self.width):
+                self.obstacle[y][x] = False
+
+    def toggle_obstacle(self, x: int, y: int, radius: int = 1) -> None:
+        """Toggle obstacle cells in a radius around (x, y)."""
+        new_val = not self.obstacle[max(0, min(y, self.height-1))][max(0, min(x, self.width-1))]
+        for dy in range(-radius + 1, radius):
+            for dx in range(-radius + 1, radius):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < self.height and 0 <= nx < self.width:
+                    if dx * dx + dy * dy < radius * radius:
+                        self.obstacle[ny][nx] = new_val
+
+    def set_obstacle(self, x: int, y: int, radius: int = 1) -> None:
+        """Set obstacle cells (paint mode)."""
+        for dy in range(-radius + 1, radius):
+            for dx in range(-radius + 1, radius):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < self.height and 0 <= nx < self.width:
+                    if dx * dx + dy * dy < radius * radius:
+                        self.obstacle[ny][nx] = True
+
+    def tick(self) -> None:
+        """Advance one LBM time step: stream → bounce-back → inlet/outlet BC → collide."""
+        w = self.width
+        h = self.height
+
+        # --- Streaming (propagation) ---
+        # Move distributions to neighboring cells in their velocity direction
+        new_f: list[list[list[float]]] = [
+            [[0.0] * w for _ in range(h)] for _ in range(9)
+        ]
+        for i in range(9):
+            cx, cy = self.CX[i], self.CY[i]
+            for y in range(h):
+                for x in range(w):
+                    # Source cell (where the distribution came from)
+                    sx = x - cx
+                    sy = y - cy
+                    if 0 <= sx < w and 0 <= sy < h:
+                        new_f[i][y][x] = self.f[i][sy][sx]
+                    else:
+                        # Boundary: use current cell value (open boundary)
+                        new_f[i][y][x] = self.f[i][y][x]
+
+        # --- Bounce-back on obstacles ---
+        for y in range(h):
+            for x in range(w):
+                if self.obstacle[y][x]:
+                    for i in range(9):
+                        new_f[self.OPP[i]][y][x] = self.f[i][y][x]
+
+        self.f = new_f
+
+        # --- Inlet boundary (left wall, Zou-He style simplified) ---
+        u0 = self.inlet_velocity
+        for y in range(1, h - 1):
+            if not self.obstacle[y][0]:
+                rho_in = 1.0
+                self.f[1][y][0] = self.f[3][y][0] + (2.0/3.0) * rho_in * u0
+                self.f[5][y][0] = self.f[7][y][0] + (1.0/6.0) * rho_in * u0
+                self.f[8][y][0] = self.f[6][y][0] + (1.0/6.0) * rho_in * u0
+
+        # --- Outlet boundary (right wall, zero-gradient) ---
+        for y in range(h):
+            for i in range(9):
+                self.f[i][y][w-1] = self.f[i][y][w-2]
+
+        # --- Top/bottom walls: bounce-back ---
+        for x in range(w):
+            for i in range(9):
+                self.f[self.OPP[i]][0][x] = self.f[i][0][x]
+                self.f[self.OPP[i]][h-1][x] = self.f[i][h-1][x]
+
+        # --- Compute macroscopic quantities and collide (BGK) ---
+        omega = self.omega
+        for y in range(h):
+            for x in range(w):
+                if self.obstacle[y][x]:
+                    self.rho[y][x] = 0.0
+                    self.ux[y][x] = 0.0
+                    self.uy[y][x] = 0.0
+                    continue
+
+                # Density and velocity from distribution
+                r = 0.0
+                vx = 0.0
+                vy = 0.0
+                for i in range(9):
+                    fi = self.f[i][y][x]
+                    r += fi
+                    vx += self.CX[i] * fi
+                    vy += self.CY[i] * fi
+
+                if r > 0.0:
+                    vx /= r
+                    vy /= r
+                else:
+                    r = 1.0
+                    vx = 0.0
+                    vy = 0.0
+
+                self.rho[y][x] = r
+                self.ux[y][x] = vx
+                self.uy[y][x] = vy
+
+                # Equilibrium and collision
+                usq = vx * vx + vy * vy
+                for i in range(9):
+                    cu = self.CX[i] * vx + self.CY[i] * vy
+                    feq = self.W[i] * r * (1.0 + 3.0 * cu + 4.5 * cu * cu - 1.5 * usq)
+                    self.f[i][y][x] += omega * (feq - self.f[i][y][x])
+
+    def velocity_magnitude(self, y: int, x: int) -> float:
+        vx = self.ux[y][x]
+        vy = self.uy[y][x]
+        return math.sqrt(vx * vx + vy * vy)
+
+    def curl(self, y: int, x: int) -> float:
+        """Compute vorticity (curl of velocity) at (x, y) for visualization."""
+        w, h = self.width, self.height
+        # duy/dx - dux/dy (finite differences)
+        uy_right = self.uy[y][min(x+1, w-1)]
+        uy_left = self.uy[y][max(x-1, 0)]
+        ux_up = self.ux[max(y-1, 0)][x]
+        ux_down = self.ux[min(y+1, h-1)][x]
+        return (uy_right - uy_left) - (ux_down - ux_up)
+
+    def max_velocity(self) -> float:
+        mx = 0.0
+        for y in range(self.height):
+            for x in range(self.width):
+                if not self.obstacle[y][x]:
+                    v = self.velocity_magnitude(y, x)
+                    if v > mx:
+                        mx = v
+        return mx
+
+    def reynolds_number(self) -> float:
+        """Approximate Reynolds number: Re = U*L / nu."""
+        # L = characteristic length (obstacle diameter ~ width/4)
+        L = max(1, min(self.width, self.height) // 4)
+        nu = self.viscosity
+        return self.inlet_velocity * L / nu if nu > 0 else 0.0
+
+    def reset(self) -> None:
+        """Reset fluid to initial equilibrium state."""
+        self._init_equilibrium()
+
+
+# ---------------------------------------------------------------------------
 # Pattern detector — identifies known still lifes, oscillators, spaceships
 # ---------------------------------------------------------------------------
 
@@ -2192,6 +2446,16 @@ class App:
         self.physarum_world: PhysarumWorld | None = None
         self.physarum_gen = 0
         self.physarum_preset_idx = 0
+        # Fluid Dynamics (Lattice Boltzmann) mode
+        self.fluid_mode = False
+        self.fluid_world: FluidWorld | None = None
+        self.fluid_gen = 0
+        self.fluid_preset_idx = 0
+        self.fluid_viz = 0          # 0=velocity, 1=vorticity, 2=density
+        self.fluid_brush_size = 2   # obstacle brush radius
+        self.fluid_cursor_x = 0
+        self.fluid_cursor_y = 0
+        self.fluid_painting = False  # True while painting obstacles
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -2232,6 +2496,9 @@ class App:
             elif self.physarum_mode:
                 if self.running:
                     self._physarum_tick()
+            elif self.fluid_mode:
+                if self.running:
+                    self._fluid_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -2320,6 +2587,14 @@ class App:
             curses.init_pair(49, curses.COLOR_GREEN, -1)   # Physarum: mid
             curses.init_pair(50, curses.COLOR_YELLOW, -1)  # Physarum: high
             curses.init_pair(51, curses.COLOR_WHITE, -1)   # Physarum: peak
+            # Fluid Dynamics gradient (velocity/vorticity visualization)
+            curses.init_pair(52, curses.COLOR_BLUE, -1)    # Fluid: slow/neg vort
+            curses.init_pair(53, curses.COLOR_CYAN, -1)    # Fluid: low
+            curses.init_pair(54, curses.COLOR_GREEN, -1)   # Fluid: medium
+            curses.init_pair(55, curses.COLOR_YELLOW, -1)  # Fluid: high
+            curses.init_pair(56, curses.COLOR_RED, -1)     # Fluid: fast/pos vort
+            curses.init_pair(57, curses.COLOR_WHITE, -1)   # Fluid: obstacle
+            curses.init_pair(58, curses.COLOR_MAGENTA, -1) # Fluid: cursor
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -2394,6 +2669,10 @@ class App:
         # Physarum (slime mold) mode has its own input handler
         if self.physarum_mode:
             return self._handle_physarum_input(key)
+
+        # Fluid Dynamics (LBM) mode has its own input handler
+        if self.fluid_mode:
+            return self._handle_fluid_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -2594,6 +2873,10 @@ class App:
         # Physarum (slime mold) mode
         elif key == ord("S"):
             self._start_physarum()
+
+        # Fluid Dynamics (Lattice Boltzmann) mode
+        elif key == ord("D"):
+            self._start_fluid()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -4220,6 +4503,293 @@ class App:
             except curses.error:
                 pass
 
+    # --- Fluid Dynamics (Lattice Boltzmann) mode ---
+
+    def _handle_fluid_input(self, key: int) -> bool:
+        """Handle input while in Fluid Dynamics mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            if not self.running:
+                self._fluid_tick()
+        elif key == ord("r"):
+            if self.fluid_world:
+                self.fluid_world.reset()
+                self.fluid_gen = 0
+                self._set_message("Fluid reset to equilibrium")
+        elif key == ord("c"):
+            if self.fluid_world:
+                self.fluid_world.clear_obstacles()
+                self.fluid_world.reset()
+                self.fluid_gen = 0
+                self._set_message("Obstacles cleared & fluid reset")
+        elif key == ord("o"):
+            if self.fluid_world:
+                self.fluid_world.clear_obstacles()
+                self.fluid_world._place_default_obstacle()
+                self.fluid_world.reset()
+                self.fluid_gen = 0
+                self._set_message("Default obstacle restored")
+        # Cycle visualization mode
+        elif key == ord("v"):
+            viz_names = ["velocity", "vorticity", "density"]
+            self.fluid_viz = (self.fluid_viz + 1) % 3
+            self._set_message(f"Visualization: {viz_names[self.fluid_viz]}")
+        # Cycle preset forward/back
+        elif key == ord("p") or key == ord("n"):
+            if self.fluid_world:
+                direction = 1 if key == ord("n") else -1
+                name = self.fluid_world.cycle_preset(direction)
+                self.fluid_preset_idx = self.fluid_world.preset_idx
+                self.fluid_world.reset()
+                self.fluid_gen = 0
+                self._set_message(f"Preset: {name}")
+        # Cursor movement for obstacle placement
+        elif key in (curses.KEY_UP, ord("k")):
+            self.fluid_cursor_y = max(0, self.fluid_cursor_y - 1)
+            if self.fluid_painting and self.fluid_world:
+                self.fluid_world.set_obstacle(self.fluid_cursor_x, self.fluid_cursor_y, self.fluid_brush_size)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            if self.fluid_world:
+                self.fluid_cursor_y = min(self.fluid_world.height - 1, self.fluid_cursor_y + 1)
+                if self.fluid_painting:
+                    self.fluid_world.set_obstacle(self.fluid_cursor_x, self.fluid_cursor_y, self.fluid_brush_size)
+        elif key in (curses.KEY_LEFT, ord("h")):
+            self.fluid_cursor_x = max(0, self.fluid_cursor_x - 1)
+            if self.fluid_painting and self.fluid_world:
+                self.fluid_world.set_obstacle(self.fluid_cursor_x, self.fluid_cursor_y, self.fluid_brush_size)
+        elif key in (curses.KEY_RIGHT, ord("l")):
+            if self.fluid_world:
+                self.fluid_cursor_x = min(self.fluid_world.width - 1, self.fluid_cursor_x + 1)
+                if self.fluid_painting:
+                    self.fluid_world.set_obstacle(self.fluid_cursor_x, self.fluid_cursor_y, self.fluid_brush_size)
+        # Toggle obstacle at cursor
+        elif key == 10 or key == 13:  # Enter
+            if self.fluid_world:
+                self.fluid_world.toggle_obstacle(self.fluid_cursor_x, self.fluid_cursor_y, self.fluid_brush_size)
+        # Paint mode toggle
+        elif key == ord("b"):
+            self.fluid_painting = not self.fluid_painting
+            self._set_message(f"Paint obstacles: {'ON' if self.fluid_painting else 'OFF'}")
+        # Brush size
+        elif key == ord("]") or key == ord("+") or key == ord("="):
+            self.fluid_brush_size = min(8, self.fluid_brush_size + 1)
+            self._set_message(f"Brush size: {self.fluid_brush_size}")
+        elif key == ord("[") or key == ord("-") or key == ord("_"):
+            self.fluid_brush_size = max(1, self.fluid_brush_size - 1)
+            self._set_message(f"Brush size: {self.fluid_brush_size}")
+        # Adjust inlet velocity
+        elif key == ord("."):
+            if self.fluid_world:
+                self.fluid_world.inlet_velocity = min(0.25, self.fluid_world.inlet_velocity + 0.01)
+                self._set_message(f"Inlet velocity: {self.fluid_world.inlet_velocity:.2f}")
+        elif key == ord(","):
+            if self.fluid_world:
+                self.fluid_world.inlet_velocity = max(0.01, self.fluid_world.inlet_velocity - 0.01)
+                self._set_message(f"Inlet velocity: {self.fluid_world.inlet_velocity:.2f}")
+        # Adjust viscosity
+        elif key == ord(">"):
+            if self.fluid_world:
+                self.fluid_world.viscosity = min(0.3, self.fluid_world.viscosity + 0.005)
+                self.fluid_world.tau = 3.0 * self.fluid_world.viscosity + 0.5
+                self.fluid_world.omega = 1.0 / self.fluid_world.tau
+                self._set_message(f"Viscosity: {self.fluid_world.viscosity:.3f}")
+        elif key == ord("<"):
+            if self.fluid_world:
+                self.fluid_world.viscosity = max(0.005, self.fluid_world.viscosity - 0.005)
+                self.fluid_world.tau = 3.0 * self.fluid_world.viscosity + 0.5
+                self.fluid_world.omega = 1.0 / self.fluid_world.tau
+                self._set_message(f"Viscosity: {self.fluid_world.viscosity:.3f}")
+        # Speed control
+        elif key == ord("f"):
+            self.speed = min(20, self.speed + 1)
+            self._update_timeout()
+        elif key == ord("d"):
+            self.speed = max(1, self.speed - 1)
+            self._update_timeout()
+        # Exit Fluid mode
+        elif key == ord("D") or key == 27:
+            self._stop_fluid()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_fluid(self) -> None:
+        """Enter Fluid Dynamics (LBM) mode."""
+        self.running = False
+        self.fluid_mode = True
+        self.fluid_gen = 0
+        self.fluid_painting = False
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(4, max_w // 2)
+        h = max(4, max_h - 3)
+        preset = FLUID_PRESET_NAMES[self.fluid_preset_idx]
+        self.fluid_world = FluidWorld(w, h, preset=preset)
+        self.fluid_cursor_x = w // 2
+        self.fluid_cursor_y = h // 2
+        self._set_message(
+            "Fluid Dynamics (LBM) — [Space]Run [Enter]Obstacle [Shift+D]Exit"
+        )
+
+    def _stop_fluid(self) -> None:
+        """Exit Fluid Dynamics mode."""
+        self.fluid_mode = False
+        self.running = False
+        self.fluid_world = None
+        self.fluid_gen = 0
+        self.fluid_painting = False
+        self._set_message("Fluid Dynamics mode ended")
+
+    def _fluid_tick(self) -> None:
+        """Advance one LBM step."""
+        if self.fluid_world:
+            self.fluid_world.tick()
+            self.fluid_gen += 1
+
+    def _draw_fluid(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the fluid field with color-coded visualization."""
+        if not self.fluid_world:
+            return
+        fw = self.fluid_world
+        shades = FLUID_SHADES
+        n_shades = len(shades)
+        viz = self.fluid_viz
+
+        # Velocity color tiers: blue → cyan → green → yellow → red
+        vel_colors = [0, 52, 53, 54, 55, 56, 56]
+        # Vorticity: negative (blue) → zero → positive (red)
+        vort_colors_neg = [52, 52, 53]   # blue/cyan for negative
+        vort_colors_pos = [55, 56, 56]   # yellow/red for positive
+
+        # Find normalization values
+        max_val = 0.001
+        rmin = 0.0  # used only for density viz
+        if viz == 0:  # velocity
+            max_val = max(0.001, fw.max_velocity())
+        elif viz == 1:  # vorticity
+            for y in range(fw.height):
+                for x in range(fw.width):
+                    if not fw.obstacle[y][x]:
+                        v = abs(fw.curl(y, x))
+                        if v > max_val:
+                            max_val = v
+        elif viz == 2:  # density
+            rmin = 1e9
+            rmax = -1e9
+            for y in range(fw.height):
+                for x in range(fw.width):
+                    if not fw.obstacle[y][x]:
+                        r = fw.rho[y][x]
+                        if r < rmin:
+                            rmin = r
+                        if r > rmax:
+                            rmax = r
+            max_val = max(0.001, rmax - rmin)
+
+        for r in range(min(grid_rows, fw.height)):
+            for c in range(min(grid_cols, fw.width)):
+                sc = c * 2
+                if sc + 1 >= max_w:
+                    break
+
+                # Cursor highlight
+                is_cursor = (c == self.fluid_cursor_x and r == self.fluid_cursor_y)
+
+                # Obstacle
+                if fw.obstacle[r][c]:
+                    attr = curses.color_pair(57) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+                    if is_cursor:
+                        attr = curses.color_pair(58) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+                    try:
+                        self.stdscr.addstr(r, sc, "██", attr)
+                    except curses.error:
+                        pass
+                    continue
+
+                # Compute value and color based on visualization
+                if viz == 0:  # velocity magnitude
+                    val = fw.velocity_magnitude(r, c)
+                    norm = val / max_val
+                    norm = max(0.0, min(1.0, norm))
+                    idx = int(norm * (n_shades - 1))
+                    idx = max(0, min(n_shades - 1, idx))
+                    pair = vel_colors[idx]
+                elif viz == 1:  # vorticity
+                    val = fw.curl(r, c)
+                    norm = val / max_val  # -1 to 1
+                    norm = max(-1.0, min(1.0, norm))
+                    abs_norm = abs(norm)
+                    idx = int(abs_norm * (n_shades - 1))
+                    idx = max(0, min(n_shades - 1, idx))
+                    if norm < 0:
+                        pair = vort_colors_neg[min(2, int(abs_norm * 3))]
+                    else:
+                        pair = vort_colors_pos[min(2, int(abs_norm * 3))]
+                else:  # density
+                    val = fw.rho[r][c] - rmin
+                    norm = val / max_val
+                    norm = max(0.0, min(1.0, norm))
+                    idx = int(norm * (n_shades - 1))
+                    idx = max(0, min(n_shades - 1, idx))
+                    pair = vel_colors[idx]
+
+                ch = shades[idx]
+                if idx == 0 and not is_cursor:
+                    continue
+
+                if is_cursor:
+                    attr = curses.color_pair(58) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+                    ch = ch if idx > 0 else "+"
+                else:
+                    attr = curses.color_pair(pair) if self.use_color and pair > 0 else 0
+                    if idx >= n_shades - 2:
+                        attr |= curses.A_BOLD
+
+                try:
+                    self.stdscr.addstr(r, sc, ch * 2 if len(ch) == 1 else ch, attr)
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            viz_names = ["velocity", "vorticity", "density"]
+            preset_name = FLUID_PRESET_NAMES[fw.preset_idx]
+            state_str = "RUNNING" if self.running else "PAUSED"
+            re_num = fw.reynolds_number()
+            status = (
+                f" Fluid LBM | Gen: {self.fluid_gen} | "
+                f"Preset: {preset_name} | "
+                f"Viz: {viz_names[self.fluid_viz]} | "
+                f"Re≈{re_num:.0f} | "
+                f"ν={fw.viscosity:.3f} U={fw.inlet_velocity:.2f} | "
+                f"Speed: {self.speed} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset | "
+                "[Arrows]Move [Enter]Wall [B]rush | "
+                "[P/N]Preset [V]iz [,/.]Vel [</>]Visc | "
+                "[C]lear [O]bstacle | [Shift+D]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -4557,6 +5127,8 @@ class App:
             self._draw_eco(max_h, max_w, grid_rows, grid_cols)
         elif self.physarum_mode:
             self._draw_physarum(max_h, max_w, grid_rows, grid_cols)
+        elif self.fluid_mode:
+            self._draw_fluid(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
