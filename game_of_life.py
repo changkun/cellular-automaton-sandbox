@@ -4340,6 +4340,345 @@ SIR_PRESETS = {
 }
 SIR_PRESET_NAMES = list(SIR_PRESETS.keys())
 
+# ── Maze Generator & Solver constants ─────────────────────────────────────
+
+MAZE_WALL = 0
+MAZE_PATH = 1
+MAZE_START = 2
+MAZE_END = 3
+MAZE_VISITED = 4      # A* explored
+MAZE_SOLUTION = 5     # final solution path
+MAZE_FRONTIER = 6     # A* frontier (open set)
+MAZE_CARVING = 7      # cell being carved during generation
+
+MAZE_PRESETS = {
+    "classic": {
+        "desc": "Classic recursive-backtracker maze",
+        "algorithm": "backtracker",
+        "solve_speed": 3,
+        "gen_speed": 5,
+        "loop_chance": 0.0,
+    },
+    "braided": {
+        "desc": "Maze with extra loops — multiple solution paths",
+        "algorithm": "backtracker",
+        "solve_speed": 3,
+        "gen_speed": 5,
+        "loop_chance": 0.15,
+    },
+    "sparse": {
+        "desc": "Sparse maze with many open areas",
+        "algorithm": "backtracker",
+        "solve_speed": 5,
+        "gen_speed": 8,
+        "loop_chance": 0.35,
+    },
+    "dense": {
+        "desc": "Dense corridors with slow solving",
+        "algorithm": "backtracker",
+        "solve_speed": 1,
+        "gen_speed": 3,
+        "loop_chance": 0.0,
+    },
+    "speed-run": {
+        "desc": "Fast generation and blazing solver",
+        "algorithm": "backtracker",
+        "solve_speed": 20,
+        "gen_speed": 40,
+        "loop_chance": 0.0,
+    },
+}
+MAZE_PRESET_NAMES = list(MAZE_PRESETS.keys())
+
+
+class MazeWorld:
+    """Maze generator (recursive backtracker) + A* solver with step-by-step viz."""
+
+    def __init__(self, width: int, height: int, preset: str = "classic"):
+        # Maze dimensions must be odd for clean walls
+        self.width = width if width % 2 == 1 else width - 1
+        self.height = height if height % 2 == 1 else height - 1
+        self.width = max(5, self.width)
+        self.height = max(5, self.height)
+        self.preset_idx = MAZE_PRESET_NAMES.index(preset)
+        self.solve_speed = 3
+        self.gen_speed = 5
+        self.loop_chance = 0.0
+
+        # Grid state
+        self.grid: list[list[int]] = []
+
+        # Generation state
+        self.gen_stack: list[tuple[int, int]] = []
+        self.generating = False
+        self.gen_done = False
+
+        # Solver state
+        self.solving = False
+        self.solve_done = False
+        self.open_set: list[tuple[float, int, int]] = []  # (f_score, r, c)
+        self.came_from: dict[tuple[int, int], tuple[int, int]] = {}
+        self.g_score: dict[tuple[int, int], float] = {}
+        self.start: tuple[int, int] = (1, 1)
+        self.end: tuple[int, int] = (1, 1)
+        self.solution_path: list[tuple[int, int]] = []
+        self.solution_draw_idx = 0
+        self.drawing_solution = False
+
+        self._apply_preset(preset)
+
+    def _apply_preset(self, name: str) -> None:
+        cfg = MAZE_PRESETS[name]
+        self.solve_speed = cfg["solve_speed"]
+        self.gen_speed = cfg["gen_speed"]
+        self.loop_chance = cfg["loop_chance"]
+        self._init_grid()
+        self._start_generation()
+
+    def _init_grid(self) -> None:
+        """Fill grid with walls."""
+        self.grid = [[MAZE_WALL] * self.width for _ in range(self.height)]
+        self.gen_done = False
+        self.solving = False
+        self.solve_done = False
+        self.open_set = []
+        self.came_from = {}
+        self.g_score = {}
+        self.solution_path = []
+        self.solution_draw_idx = 0
+        self.drawing_solution = False
+
+    def _start_generation(self) -> None:
+        """Begin recursive-backtracker maze generation."""
+        import random as _rng
+        self._init_grid()
+        # Start carving from (1,1)
+        sr, sc = 1, 1
+        self.grid[sr][sc] = MAZE_CARVING
+        self.gen_stack = [(sr, sc)]
+        self.generating = True
+        self.gen_done = False
+
+    def _gen_step(self) -> None:
+        """One step of recursive-backtracker generation."""
+        import random as _rng
+        if not self.gen_stack:
+            self.generating = False
+            self.gen_done = True
+            self._finalize_generation()
+            return
+
+        r, c = self.gen_stack[-1]
+        # Convert current carving to path
+        if self.grid[r][c] == MAZE_CARVING:
+            self.grid[r][c] = MAZE_PATH
+
+        # Find unvisited neighbors (2 cells away)
+        neighbors = []
+        for dr, dc in [(-2, 0), (2, 0), (0, -2), (0, 2)]:
+            nr, nc = r + dr, c + dc
+            if 0 < nr < self.height - 1 and 0 < nc < self.width - 1:
+                if self.grid[nr][nc] == MAZE_WALL:
+                    neighbors.append((nr, nc, r + dr // 2, c + dc // 2))
+
+        if neighbors:
+            _rng.shuffle(neighbors)
+            nr, nc, wr, wc = neighbors[0]
+            self.grid[wr][wc] = MAZE_PATH  # carve wall between
+            self.grid[nr][nc] = MAZE_CARVING
+            self.gen_stack.append((nr, nc))
+        else:
+            self.gen_stack.pop()
+
+    def _finalize_generation(self) -> None:
+        """Post-generation: add loops, set start/end."""
+        import random as _rng
+
+        # Optionally add loops (braid the maze)
+        if self.loop_chance > 0:
+            for r in range(1, self.height - 1):
+                for c in range(1, self.width - 1):
+                    if self.grid[r][c] == MAZE_WALL:
+                        # Count adjacent path cells
+                        adj_paths = 0
+                        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                            nr, nc = r + dr, c + dc
+                            if 0 <= nr < self.height and 0 <= nc < self.width:
+                                if self.grid[nr][nc] == MAZE_PATH:
+                                    adj_paths += 1
+                        if adj_paths >= 2 and _rng.random() < self.loop_chance:
+                            self.grid[r][c] = MAZE_PATH
+
+        # Set start and end
+        self.start = (1, 1)
+        # End at bottom-right path cell
+        er = self.height - 2 if (self.height - 2) % 2 == 1 else self.height - 3
+        ec = self.width - 2 if (self.width - 2) % 2 == 1 else self.width - 3
+        self.end = (er, ec)
+        self.grid[self.start[0]][self.start[1]] = MAZE_START
+        self.grid[self.end[0]][self.end[1]] = MAZE_END
+
+    def start_solve(self) -> None:
+        """Begin A* pathfinding from start to end."""
+        import heapq
+        self.solving = True
+        self.solve_done = False
+        self.drawing_solution = False
+        self.solution_path = []
+        self.solution_draw_idx = 0
+
+        # Clear previous solve visuals
+        for r in range(self.height):
+            for c in range(self.width):
+                if self.grid[r][c] in (MAZE_VISITED, MAZE_SOLUTION, MAZE_FRONTIER):
+                    self.grid[r][c] = MAZE_PATH
+
+        sr, sc = self.start
+        er, ec = self.end
+        self.grid[sr][sc] = MAZE_START
+        self.grid[er][ec] = MAZE_END
+
+        self.g_score = {(sr, sc): 0.0}
+        f = self._heuristic(sr, sc, er, ec)
+        self.open_set = [(f, sr, sc)]
+        self.came_from = {}
+
+    def _heuristic(self, r: int, c: int, er: int, ec: int) -> float:
+        """Manhattan distance heuristic."""
+        return float(abs(r - er) + abs(c - ec))
+
+    def _solve_step(self) -> None:
+        """One step of A* search."""
+        import heapq
+        if not self.open_set:
+            self.solving = False
+            self.solve_done = True
+            return
+
+        _, cr, cc = heapq.heappop(self.open_set)
+
+        if (cr, cc) == self.end:
+            self.solving = False
+            self._reconstruct_path()
+            return
+
+        # Mark as visited
+        if self.grid[cr][cc] not in (MAZE_START, MAZE_END):
+            self.grid[cr][cc] = MAZE_VISITED
+
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nr, nc = cr + dr, cc + dc
+            if 0 <= nr < self.height and 0 <= nc < self.width:
+                cell = self.grid[nr][nc]
+                if cell == MAZE_WALL:
+                    continue
+                tent_g = self.g_score.get((cr, cc), float('inf')) + 1.0
+                if tent_g < self.g_score.get((nr, nc), float('inf')):
+                    self.came_from[(nr, nc)] = (cr, cc)
+                    self.g_score[(nr, nc)] = tent_g
+                    f = tent_g + self._heuristic(nr, nc, self.end[0], self.end[1])
+                    heapq.heappush(self.open_set, (f, nr, nc))
+                    if cell not in (MAZE_START, MAZE_END, MAZE_VISITED):
+                        self.grid[nr][nc] = MAZE_FRONTIER
+
+    def _reconstruct_path(self) -> None:
+        """Build solution path from came_from map."""
+        path = []
+        current = self.end
+        while current in self.came_from:
+            path.append(current)
+            current = self.came_from[current]
+        path.append(self.start)
+        path.reverse()
+        self.solution_path = path
+        self.solution_draw_idx = 0
+        self.drawing_solution = True
+
+    def _draw_solution_step(self) -> None:
+        """Animate drawing the solution path one cell at a time."""
+        if self.solution_draw_idx < len(self.solution_path):
+            r, c = self.solution_path[self.solution_draw_idx]
+            if self.grid[r][c] not in (MAZE_START, MAZE_END):
+                self.grid[r][c] = MAZE_SOLUTION
+            self.solution_draw_idx += 1
+        else:
+            self.drawing_solution = False
+            self.solve_done = True
+
+    def tick(self) -> None:
+        """Advance the simulation by one tick."""
+        if self.generating:
+            for _ in range(self.gen_speed):
+                if self.generating:
+                    self._gen_step()
+            # Auto-start solving when generation finishes
+            if self.gen_done and not self.solving and not self.solve_done:
+                self.start_solve()
+        elif self.solving:
+            for _ in range(self.solve_speed):
+                if self.solving:
+                    self._solve_step()
+        elif self.drawing_solution:
+            for _ in range(max(1, self.solve_speed // 2)):
+                if self.drawing_solution:
+                    self._draw_solution_step()
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(MAZE_PRESET_NAMES)
+        name = MAZE_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def reset(self) -> None:
+        self._apply_preset(MAZE_PRESET_NAMES[self.preset_idx])
+
+    def toggle_wall(self, r: int, c: int) -> None:
+        """Toggle a wall at grid position (r, c)."""
+        if 0 < r < self.height - 1 and 0 < c < self.width - 1:
+            if self.grid[r][c] == MAZE_WALL:
+                self.grid[r][c] = MAZE_PATH
+            elif self.grid[r][c] in (MAZE_PATH, MAZE_VISITED, MAZE_SOLUTION, MAZE_FRONTIER):
+                self.grid[r][c] = MAZE_WALL
+
+    @property
+    def phase(self) -> str:
+        if self.generating:
+            return "GENERATING"
+        elif self.solving:
+            return "SOLVING"
+        elif self.drawing_solution:
+            return "TRACING"
+        elif self.solve_done:
+            return "DONE"
+        elif self.gen_done:
+            return "READY"
+        else:
+            return "IDLE"
+
+    @property
+    def stats(self) -> dict:
+        walls = paths = visited = solution = frontier = 0
+        for row in self.grid:
+            for cell in row:
+                if cell == MAZE_WALL:
+                    walls += 1
+                elif cell in (MAZE_PATH, MAZE_START, MAZE_END):
+                    paths += 1
+                elif cell == MAZE_VISITED:
+                    visited += 1
+                elif cell == MAZE_SOLUTION:
+                    solution += 1
+                elif cell == MAZE_FRONTIER:
+                    frontier += 1
+        return {
+            "walls": walls,
+            "paths": paths,
+            "visited": visited,
+            "solution": solution,
+            "frontier": frontier,
+            "sol_len": len(self.solution_path) if self.solution_path else 0,
+        }
+
 
 class SIRWorld:
     """Epidemic SIR (Susceptible-Infected-Recovered) grid simulation."""
@@ -5313,6 +5652,11 @@ class App:
         self.sir_world: SIRWorld | None = None
         self.sir_gen = 0
         self.sir_preset_idx = 0
+        # Maze Generator & Solver mode
+        self.maze_mode = False
+        self.maze_world: MazeWorld | None = None
+        self.maze_gen = 0
+        self.maze_preset_idx = 0
         # Demo Tour (screensaver) state
         self.demo_tour_mode = False
         self.demo_tour_idx = 0          # current index into MENU_MODES
@@ -5351,6 +5695,8 @@ class App:
             # --- Procedural ---
             ("Procedural", "Wave Function Collapse (T)", "Constraint-based procedural terrain generation", "_start_wfc"),
             ("Procedural", "Turmites (U)", "2D Turing machines on a grid", "_start_turmite"),
+            # --- Algorithms ---
+            ("Algorithms", "Maze Solver (M)", "Procedural maze generation with A* pathfinding", "_start_maze"),
         ]
         # Precompute category boundaries for menu rendering
         self._menu_categories: list[str] = []
@@ -5445,6 +5791,9 @@ class App:
             elif self.sir_mode:
                 if self.running:
                     self._sir_tick()
+            elif self.maze_mode:
+                if self.running:
+                    self._maze_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -5625,6 +5974,15 @@ class App:
             curses.init_pair(164, curses.COLOR_WHITE, -1)    # SIR: dead
             curses.init_pair(165, curses.COLOR_MAGENTA, -1)  # SIR: infected (late)
 
+            curses.init_pair(170, curses.COLOR_WHITE, -1)    # Maze: wall
+            curses.init_pair(171, curses.COLOR_WHITE, -1)    # Maze: path
+            curses.init_pair(172, curses.COLOR_GREEN, -1)     # Maze: start
+            curses.init_pair(173, curses.COLOR_RED, -1)       # Maze: end
+            curses.init_pair(174, curses.COLOR_BLUE, -1)      # Maze: visited
+            curses.init_pair(175, curses.COLOR_YELLOW, -1)    # Maze: solution
+            curses.init_pair(176, curses.COLOR_CYAN, -1)      # Maze: frontier
+            curses.init_pair(177, curses.COLOR_MAGENTA, -1)   # Maze: carving
+
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
         if age < self.AGE_YOUNG:
@@ -5758,6 +6116,10 @@ class App:
         # Epidemic SIR mode has its own input handler
         if self.sir_mode:
             return self._handle_sir_input(key)
+
+        # Maze mode has its own input handler
+        if self.maze_mode:
+            return self._handle_maze_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -6010,6 +6372,10 @@ class App:
         # Epidemic SIR simulation mode
         elif key == ord("H"):
             self._start_sir()
+
+        # Maze Generator & Solver mode
+        elif key == ord("M"):
+            self._start_maze()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -10390,6 +10756,213 @@ class App:
             except curses.error:
                 pass
 
+    # --- Maze Generator & Solver mode ---
+
+    def _handle_maze_input(self, key: int) -> bool:
+        """Handle input while in Maze mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            self._maze_tick()
+        elif key == ord("r"):
+            if self.maze_world:
+                self.maze_world.reset()
+                self.maze_gen = 0
+                self.running = True
+                self._set_message("Maze reset — generating…")
+        elif key == ord("p"):
+            if self.maze_world:
+                name = self.maze_world.cycle_preset(-1)
+                self.maze_preset_idx = self.maze_world.preset_idx
+                self.maze_gen = 0
+                self.running = True
+                self._set_message(f"Preset: {name}")
+        elif key == ord("n"):
+            if self.maze_world:
+                name = self.maze_world.cycle_preset(1)
+                self.maze_preset_idx = self.maze_world.preset_idx
+                self.maze_gen = 0
+                self.running = True
+                self._set_message(f"Preset: {name}")
+        elif key == ord("f"):
+            if self.maze_world:
+                self.maze_world.solve_speed = min(50, self.maze_world.solve_speed + 1)
+                self.maze_world.gen_speed = min(80, self.maze_world.gen_speed + 2)
+                self._set_message(f"Speed: gen={self.maze_world.gen_speed} solve={self.maze_world.solve_speed}")
+        elif key == ord("d"):
+            if self.maze_world:
+                self.maze_world.solve_speed = max(1, self.maze_world.solve_speed - 1)
+                self.maze_world.gen_speed = max(1, self.maze_world.gen_speed - 2)
+                self._set_message(f"Speed: gen={self.maze_world.gen_speed} solve={self.maze_world.solve_speed}")
+        elif key == ord("g"):
+            # Re-generate (new random maze)
+            if self.maze_world:
+                self.maze_world.reset()
+                self.maze_gen = 0
+                self.running = True
+                self._set_message("New maze generating…")
+        elif key == ord("v"):
+            # Manually trigger solve
+            if self.maze_world and self.maze_world.gen_done and not self.maze_world.solving:
+                self.maze_world.start_solve()
+                self.running = True
+                self._set_message("Solving…")
+        elif key == ord("M") or key == 27:  # Shift+M or ESC to exit
+            self._stop_maze()
+        elif key == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                if self.maze_world and bstate & curses.BUTTON1_CLICKED:
+                    gc = mx // 2
+                    gr = my
+                    self.maze_world.toggle_wall(gr, gc)
+            except curses.error:
+                pass
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_maze(self) -> None:
+        """Enter Maze Generator & Solver mode."""
+        self.running = True
+        self.maze_mode = True
+        self.maze_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(5, max_w // 2)
+        h = max(5, max_h - 3)
+        preset = MAZE_PRESET_NAMES[self.maze_preset_idx]
+        self.maze_world = MazeWorld(w, h, preset=preset)
+        try:
+            curses.mousemask(curses.BUTTON1_CLICKED)
+        except curses.error:
+            pass
+        self._set_message(
+            "Maze Solver — [Space]Run [P/N]Preset [G]enerate [V]Solve [Click]Wall [Shift+M]Exit"
+        )
+
+    def _stop_maze(self) -> None:
+        """Exit Maze mode."""
+        self.maze_mode = False
+        self.running = False
+        self.maze_world = None
+        self.maze_gen = 0
+        self._set_message("Maze mode ended")
+
+    def _maze_tick(self) -> None:
+        """Advance one maze simulation step."""
+        if self.maze_world:
+            self.maze_world.tick()
+            self.maze_gen += 1
+
+    def _draw_maze(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the Maze Generator & Solver simulation."""
+        if not self.maze_world:
+            return
+        mw = self.maze_world
+
+        draw_h = min(grid_rows, mw.height)
+        draw_w = min(grid_cols, mw.width)
+
+        for r in range(draw_h):
+            row = mw.grid[r]
+            for c in range(draw_w):
+                sc = c * 2
+                if sc + 1 >= max_w:
+                    break
+
+                cell = row[c]
+                if cell == MAZE_WALL:
+                    ch = "██"
+                    if self.use_color:
+                        attr = curses.color_pair(170) | curses.A_DIM
+                    else:
+                        attr = curses.A_REVERSE
+                elif cell == MAZE_PATH:
+                    ch = "  "
+                    attr = curses.A_NORMAL
+                elif cell == MAZE_START:
+                    ch = "SS"
+                    if self.use_color:
+                        attr = curses.color_pair(172) | curses.A_BOLD
+                    else:
+                        attr = curses.A_BOLD
+                elif cell == MAZE_END:
+                    ch = "EE"
+                    if self.use_color:
+                        attr = curses.color_pair(173) | curses.A_BOLD
+                    else:
+                        attr = curses.A_BOLD | curses.A_REVERSE
+                elif cell == MAZE_VISITED:
+                    ch = "░░"
+                    if self.use_color:
+                        attr = curses.color_pair(174)
+                    else:
+                        attr = curses.A_DIM
+                elif cell == MAZE_SOLUTION:
+                    ch = "██"
+                    if self.use_color:
+                        attr = curses.color_pair(175) | curses.A_BOLD
+                    else:
+                        attr = curses.A_BOLD
+                elif cell == MAZE_FRONTIER:
+                    ch = "▓▓"
+                    if self.use_color:
+                        attr = curses.color_pair(176)
+                    else:
+                        attr = curses.A_NORMAL
+                elif cell == MAZE_CARVING:
+                    ch = "▒▒"
+                    if self.use_color:
+                        attr = curses.color_pair(177) | curses.A_BOLD
+                    else:
+                        attr = curses.A_BOLD
+                else:
+                    continue
+
+                try:
+                    self.stdscr.addstr(r, sc, ch, attr)
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            preset_name = MAZE_PRESET_NAMES[mw.preset_idx]
+            state_str = "RUNNING" if self.running else "PAUSED"
+            st = mw.stats
+            phase = mw.phase
+            status = (
+                f" Maze Solver | Gen: {self.maze_gen} | "
+                f"Phase: {phase} | "
+                f"Walls: {st['walls']} Paths: {st['paths']} | "
+                f"Explored: {st['visited']} Frontier: {st['frontier']} | "
+                f"Solution: {st['sol_len']} | "
+                f"{preset_name} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset [G]enerate [V]Solve | "
+                "[P/N]Preset [F]aster [D]slower | "
+                "[Click]Toggle wall | [Shift+M]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -10755,6 +11328,8 @@ class App:
             self._draw_dla(max_h, max_w, grid_rows, grid_cols)
         elif self.sir_mode:
             self._draw_sir(max_h, max_w, grid_rows, grid_cols)
+        elif self.maze_mode:
+            self._draw_maze(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
@@ -11581,6 +12156,8 @@ class App:
             self._stop_dla()
         elif self.sir_mode:
             self._stop_sir()
+        elif self.maze_mode:
+            self._stop_maze()
         elif self.split_mode:
             self._stop_split()
         elif self.evolve_mode:
@@ -11895,6 +12472,7 @@ class App:
             "Physics": 10,            # green
             "Biology": 9,             # yellow
             "Procedural": 12,         # magenta
+            "Algorithms": 11,         # cyan
         }
 
         # Render visible lines
