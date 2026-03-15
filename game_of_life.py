@@ -6805,13 +6805,13 @@ class App:
             ("Physics", "Magnetic Field (G)", "Electromagnetic particle simulation", "_start_magfield"),
             ("Physics", "N-Body Gravity (K)", "Gravitational N-body simulation", "_start_nbody"),
             ("Physics", "Hydraulic Erosion (Y)", "Terrain erosion by water flow", "_start_erosion"),
-            ("Physics", "DLA (L)", "Diffusion-limited aggregation crystal growth", "_start_dla"),
+            ("Physics", "DLA (Q)", "Diffusion-limited aggregation crystal growth", "_start_dla"),
             # --- Biology ---
             ("Biology", "Particle Life (P)", "Emergent life-like behavior from simple attraction rules", "_start_pl"),
             ("Biology", "Wa-Tor Ecosystem (E)", "Predator-prey population dynamics", "_start_eco"),
             ("Biology", "Physarum Slime (S)", "Slime mold agent-based network formation", "_start_physarum"),
             ("Biology", "Boids Flocking (B)", "Reynolds flocking with separation/alignment/cohesion", "_start_boids"),
-            ("Biology", "Forest Fire (F)", "Stochastic forest fire cellular automaton", "_start_forestfire"),
+            ("Biology", "Forest Fire (C)", "Stochastic forest fire cellular automaton", "_start_forestfire"),
             ("Biology", "Epidemic SIR (H)", "Disease spread with susceptible/infected/recovered agents", "_start_sir"),
             # --- Procedural ---
             ("Procedural", "Wave Function Collapse (T)", "Constraint-based procedural terrain generation", "_start_wfc"),
@@ -7472,7 +7472,7 @@ class App:
             self._set_message(f"Brush shape: {self.brush_shape}")
 
         # Heatmap mode toggle
-        elif key == ord("H"):
+        elif key == ord("~"):
             self.heatmap_mode = not self.heatmap_mode
             if self.heatmap_mode:
                 self._set_message("Heatmap ON — tracking cell activity")
@@ -7552,11 +7552,11 @@ class App:
             self._start_sandpile()
 
         # Forest Fire simulation mode
-        elif key == ord("F"):
+        elif key == ord("C"):
             self._start_forestfire()
 
         # DLA (Diffusion-Limited Aggregation) simulation mode
-        elif key == ord("L"):
+        elif key == ord("Q"):
             self._start_dla()
 
         # Epidemic SIR simulation mode
