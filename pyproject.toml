@@ -1,0 +1,39 @@
+[project]
+name = "cellular-automaton-sandbox"
+version = "1.0.0"
+description = "Terminal-based simulation suite with 27 interactive modes — cellular automata, physics, biology, fractals, and more"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = []
+authors = [
+    { name = "Changkun Ou" },
+]
+keywords = [
+    "cellular-automata",
+    "game-of-life",
+    "terminal",
+    "curses",
+    "simulation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Topic :: Games/Entertainment :: Simulation",
+]
+
+[project.scripts]
+cellaut = "game_of_life:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["game_of_life.py"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
