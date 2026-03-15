@@ -325,7 +325,7 @@ class Grid:
 # ---------------------------------------------------------------------------
 
 # Automaton type names for cycling
-MULTISTATE_TYPES = ["Life", "Brian's Brain", "Wireworld"]
+MULTISTATE_TYPES = ["Life", "Brian's Brain", "Wireworld", "Langton's Ant"]
 
 # Brian's Brain cell states
 BB_OFF = 0
@@ -338,6 +338,17 @@ WW_HEAD = 1
 WW_TAIL = 2
 WW_CONDUCTOR = 3
 
+# Langton's Ant cell states
+LA_WHITE = 0
+LA_BLACK = 1
+# Ant directions: 0=up, 1=right, 2=down, 3=left
+LA_UP = 0
+LA_RIGHT = 1
+LA_DOWN = 2
+LA_LEFT = 3
+# Direction deltas: (dr, dc) for each direction
+LA_DELTAS = {LA_UP: (-1, 0), LA_RIGHT: (0, 1), LA_DOWN: (1, 0), LA_LEFT: (0, -1)}
+
 
 class MultiStateGrid:
     """Grid that supports multi-state cellular automata (Brian's Brain, Wireworld)."""
@@ -348,9 +359,11 @@ class MultiStateGrid:
         # Each cell stores an int state; 0 = default/empty, absent = empty
         self.cells: dict[tuple[int, int], int] = {}
         self.toroidal = False
+        self.ants: list[tuple[int, int, int]] = []
 
     def clear(self) -> None:
         self.cells.clear()
+        self.ants.clear()
 
     def _neighbors(self, r: int, c: int):
         """Yield valid neighbor coordinates."""
@@ -491,6 +504,84 @@ class MultiStateGrid:
             num_heads = max(1, len(alive) // 10)
             for pos in random.sample(alive, min(num_heads, len(alive))):
                 self.cells[pos] = WW_HEAD
+        elif automaton_type == "Langton's Ant":
+            # Convert alive cells to black, place one ant at center
+            for pos in grid.cells:
+                self.cells[pos] = LA_BLACK
+            self.ants = [(self.height // 2, self.width // 2, LA_UP)]
+
+    # --- Langton's Ant ---
+
+    def tick_langtons_ant(self) -> None:
+        """Advance one step of Langton's Ant.
+
+        Rules for each ant:
+        - On a white cell: turn 90° right, flip to black, move forward
+        - On a black cell: turn 90° left, flip to white, move forward
+        """
+        if not hasattr(self, "ants"):
+            self.ants = []
+        new_ants = []
+        for r, c, direction in self.ants:
+            state = self.cells.get((r, c), LA_WHITE)
+            if state == LA_WHITE:
+                # Turn right
+                new_dir = (direction + 1) % 4
+                self.cells[(r, c)] = LA_BLACK
+            else:
+                # Turn left
+                new_dir = (direction - 1) % 4
+                # Flip to white (remove from dict)
+                if (r, c) in self.cells:
+                    del self.cells[(r, c)]
+            # Move forward
+            dr, dc = LA_DELTAS[new_dir]
+            nr, nc = r + dr, c + dc
+            if self.toroidal:
+                nr %= self.height
+                nc %= self.width
+            elif not (0 <= nr < self.height and 0 <= nc < self.width):
+                # Ant hits boundary, keep in place
+                nr, nc = r, c
+            new_ants.append((nr, nc, new_dir))
+        self.ants = new_ants
+
+    def randomize_langtons_ant(self, num_ants: int = 4) -> None:
+        """Place multiple ants on a blank grid."""
+        self.cells.clear()
+        self.ants = []
+        for _ in range(num_ants):
+            r = random.randint(0, self.height - 1)
+            c = random.randint(0, self.width - 1)
+            direction = random.randint(0, 3)
+            self.ants.append((r, c, direction))
+
+    def toggle_cell_langtons_ant(self, r: int, c: int) -> None:
+        """Cycle cell state: WHITE -> BLACK -> ANT -> WHITE.
+
+        Placing an ant adds a new upward-facing ant at the position.
+        """
+        pos = (r, c)
+        # Check if there's an ant here
+        if hasattr(self, "ants"):
+            for i, (ar, ac, ad) in enumerate(self.ants):
+                if ar == r and ac == c:
+                    # Remove ant, keep cell as-is
+                    self.ants.pop(i)
+                    return
+        state = self.cells.get(pos, LA_WHITE)
+        if state == LA_WHITE:
+            self.cells[pos] = LA_BLACK
+        elif state == LA_BLACK:
+            # Place an ant here (on white cell)
+            if (r, c) in self.cells:
+                del self.cells[(r, c)]
+            if not hasattr(self, "ants"):
+                self.ants = []
+            self.ants.append((r, c, LA_UP))
+        else:
+            if pos in self.cells:
+                del self.cells[pos]
 
 
 # ---------------------------------------------------------------------------
@@ -1075,6 +1166,8 @@ class App:
             curses.init_pair(19, curses.COLOR_YELLOW, -1)  # Wireworld: HEAD (electron)
             curses.init_pair(20, curses.COLOR_RED, -1)     # Wireworld: TAIL
             curses.init_pair(21, curses.COLOR_CYAN, -1)    # Wireworld: CONDUCTOR
+            curses.init_pair(22, curses.COLOR_WHITE, -1)   # Langton's Ant: BLACK cell
+            curses.init_pair(23, curses.COLOR_RED, -1)     # Langton's Ant: ANT
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -1743,6 +1836,8 @@ class App:
                     self.multistate_grid.toggle_cell_brians_brain(self.cursor_r, self.cursor_c)
                 elif atype == "Wireworld":
                     self.multistate_grid.toggle_cell_wireworld(self.cursor_r, self.cursor_c)
+                elif atype == "Langton's Ant":
+                    self.multistate_grid.toggle_cell_langtons_ant(self.cursor_r, self.cursor_c)
         # Cycle automaton type with F/G
         elif key == ord("f"):
             self.multistate_type_idx = (self.multistate_type_idx + 1) % len(MULTISTATE_TYPES)
@@ -1829,6 +1924,8 @@ class App:
             self.multistate_grid.tick_brians_brain()
         elif atype == "Wireworld":
             self.multistate_grid.tick_wireworld()
+        elif atype == "Langton's Ant":
+            self.multistate_grid.tick_langtons_ant()
         self.multistate_gen += 1
 
     def _multistate_randomize(self) -> None:
@@ -1840,6 +1937,8 @@ class App:
             self.multistate_grid.randomize_brians_brain()
         elif atype == "Wireworld":
             self.multistate_grid.randomize_wireworld()
+        elif atype == "Langton's Ant":
+            self.multistate_grid.randomize_langtons_ant()
 
     # --- brush mode ---
 
@@ -2335,6 +2434,10 @@ class App:
             elif state == WW_CONDUCTOR:
                 attr = curses.color_pair(21) if self.use_color else curses.A_NORMAL
                 return "░░", attr
+        elif automaton_type == "Langton's Ant":
+            if state == LA_BLACK:
+                attr = (curses.color_pair(22) | curses.A_BOLD) if self.use_color else curses.A_BOLD
+                return "██", attr
         return "  ", 0
 
     def _draw_multistate(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
@@ -2343,6 +2446,12 @@ class App:
             return
         atype = MULTISTATE_TYPES[self.multistate_type_idx]
         mg = self.multistate_grid
+
+        # Build ant position set for fast lookup during rendering
+        ant_positions: set[tuple[int, int]] = set()
+        if atype == "Langton's Ant" and hasattr(mg, "ants"):
+            for ar, ac, _ad in mg.ants:
+                ant_positions.add((ar, ac))
 
         for screen_r in range(min(grid_rows, mg.height)):
             r = screen_r + self.view_r
@@ -2358,12 +2467,16 @@ class App:
 
                 state = mg.cells.get((r, c), 0)
                 is_cursor = (r == self.cursor_r and c == self.cursor_c)
+                is_ant = (r, c) in ant_positions
 
                 if is_cursor:
                     attr = curses.A_REVERSE
                     if self.use_color:
                         attr |= curses.color_pair(2)
-                    ch = "██" if state != 0 else "▒▒"
+                    ch = "██" if (state != 0 or is_ant) else "▒▒"
+                elif is_ant:
+                    attr = (curses.color_pair(23) | curses.A_BOLD) if self.use_color else curses.A_BOLD
+                    ch = "▓▓"
                 elif state != 0:
                     ch, attr = self._multistate_cell_attr(state, atype)
                 else:
@@ -2385,11 +2498,17 @@ class App:
                 on = sum(1 for s in mg.cells.values() if s == BB_ON)
                 dying = sum(1 for s in mg.cells.values() if s == BB_DYING)
                 breakdown = f"ON:{on} DYING:{dying}"
-            else:
+            elif atype == "Wireworld":
                 heads = sum(1 for s in mg.cells.values() if s == WW_HEAD)
                 tails = sum(1 for s in mg.cells.values() if s == WW_TAIL)
                 conds = sum(1 for s in mg.cells.values() if s == WW_CONDUCTOR)
                 breakdown = f"HEAD:{heads} TAIL:{tails} WIRE:{conds}"
+            elif atype == "Langton's Ant":
+                black = sum(1 for s in mg.cells.values() if s == LA_BLACK)
+                num_ants = len(mg.ants) if hasattr(mg, "ants") else 0
+                breakdown = f"BLACK:{black} ANTS:{num_ants}"
+            else:
+                breakdown = ""
             status = (
                 f" {atype} | Gen: {self.multistate_gen} | Cells: {cell_count} ({breakdown}) | "
                 f"Speed: {self.speed} | {topo} | {state_str} "
@@ -2408,8 +2527,12 @@ class App:
         if help_y > 0:
             if atype == "Brian's Brain":
                 legend = "ON=██ DYING=▒▒"
-            else:
+            elif atype == "Wireworld":
                 legend = "HEAD=██ TAIL=██ WIRE=░░"
+            elif atype == "Langton's Ant":
+                legend = "ANT=▓▓ BLACK=██"
+            else:
+                legend = ""
             help_text = (
                 f" [Space]Run [S]tep [R]and [C]lear [Enter]Cycle cell | "
                 f"[F/G]Type:{atype} | {legend} | "
