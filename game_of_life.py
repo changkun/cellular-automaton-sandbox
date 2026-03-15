@@ -5300,6 +5300,221 @@ class AttractorWorld:
         }
 
 
+DOUBLE_PENDULUM_PRESETS = {
+    "classic": {
+        "m1": 1.0, "m2": 1.0, "L1": 1.0, "L2": 1.0,
+        "theta1": 2.5, "theta2": 2.5, "omega1": 0.0, "omega2": 0.0,
+        "damping": 0.0, "g": 9.81, "dt": 0.002, "steps_per_tick": 20,
+        "delta": 0.001,
+    },
+    "heavy-light": {
+        "m1": 5.0, "m2": 1.0, "L1": 1.0, "L2": 1.0,
+        "theta1": 2.0, "theta2": 2.8, "omega1": 0.0, "omega2": 0.0,
+        "damping": 0.0, "g": 9.81, "dt": 0.002, "steps_per_tick": 20,
+        "delta": 0.001,
+    },
+    "long-short": {
+        "m1": 1.0, "m2": 1.0, "L1": 1.5, "L2": 0.5,
+        "theta1": 2.8, "theta2": 3.0, "omega1": 0.0, "omega2": 0.0,
+        "damping": 0.0, "g": 9.81, "dt": 0.002, "steps_per_tick": 20,
+        "delta": 0.001,
+    },
+    "high-energy": {
+        "m1": 1.0, "m2": 1.0, "L1": 1.0, "L2": 1.0,
+        "theta1": 3.1, "theta2": 3.0, "omega1": 1.0, "omega2": -1.0,
+        "damping": 0.0, "g": 9.81, "dt": 0.001, "steps_per_tick": 30,
+        "delta": 0.0005,
+    },
+    "damped": {
+        "m1": 1.0, "m2": 1.0, "L1": 1.0, "L2": 1.0,
+        "theta1": 2.5, "theta2": 2.5, "omega1": 0.0, "omega2": 0.0,
+        "damping": 0.02, "g": 9.81, "dt": 0.002, "steps_per_tick": 20,
+        "delta": 0.001,
+    },
+    "symmetric": {
+        "m1": 1.0, "m2": 1.0, "L1": 1.0, "L2": 1.0,
+        "theta1": 1.5, "theta2": -1.5, "omega1": 0.0, "omega2": 0.0,
+        "damping": 0.0, "g": 9.81, "dt": 0.002, "steps_per_tick": 20,
+        "delta": 0.001,
+    },
+}
+DOUBLE_PENDULUM_PRESET_NAMES = list(DOUBLE_PENDULUM_PRESETS.keys())
+
+
+class DoublePendulumWorld:
+    """Double pendulum chaos simulation — two side-by-side pendulums with
+    near-identical initial conditions that diverge chaotically."""
+
+    def __init__(self, width: int, height: int, preset: str = "classic"):
+        self.width = width
+        self.height = height
+        self.preset_idx = DOUBLE_PENDULUM_PRESET_NAMES.index(preset)
+
+        # Physics state for pendulum A
+        self.a_theta1 = 0.0
+        self.a_theta2 = 0.0
+        self.a_omega1 = 0.0
+        self.a_omega2 = 0.0
+
+        # Physics state for pendulum B (starts with tiny delta)
+        self.b_theta1 = 0.0
+        self.b_theta2 = 0.0
+        self.b_omega1 = 0.0
+        self.b_omega2 = 0.0
+
+        # Parameters
+        self.m1 = 1.0
+        self.m2 = 1.0
+        self.L1 = 1.0
+        self.L2 = 1.0
+        self.g = 9.81
+        self.dt = 0.002
+        self.steps_per_tick = 20
+        self.damping = 0.0
+        self.delta = 0.001  # initial angle difference
+
+        # Trails (screen coords of second bob)
+        self.trail_a: list[tuple[int, int]] = []
+        self.trail_b: list[tuple[int, int]] = []
+        self.trail_len = 600
+        self.show_trail = True
+
+        self.total_steps = 0
+        self.paused = False
+
+        self._apply_preset(preset)
+
+    def _apply_preset(self, name: str) -> None:
+        cfg = DOUBLE_PENDULUM_PRESETS[name]
+        self.m1 = cfg["m1"]
+        self.m2 = cfg["m2"]
+        self.L1 = cfg["L1"]
+        self.L2 = cfg["L2"]
+        self.g = cfg["g"]
+        self.dt = cfg["dt"]
+        self.steps_per_tick = cfg["steps_per_tick"]
+        self.damping = cfg["damping"]
+        self.delta = cfg["delta"]
+
+        self.a_theta1 = cfg["theta1"]
+        self.a_theta2 = cfg["theta2"]
+        self.a_omega1 = cfg["omega1"]
+        self.a_omega2 = cfg["omega2"]
+
+        self.b_theta1 = cfg["theta1"] + self.delta
+        self.b_theta2 = cfg["theta2"] + self.delta
+        self.b_omega1 = cfg["omega1"]
+        self.b_omega2 = cfg["omega2"]
+
+        self.trail_a.clear()
+        self.trail_b.clear()
+        self.total_steps = 0
+        self.paused = False
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(DOUBLE_PENDULUM_PRESET_NAMES)
+        name = DOUBLE_PENDULUM_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def reset(self) -> None:
+        self._apply_preset(DOUBLE_PENDULUM_PRESET_NAMES[self.preset_idx])
+
+    def _derivs(self, theta1: float, theta2: float, omega1: float, omega2: float) -> tuple[float, float, float, float]:
+        """Compute derivatives for double pendulum equations of motion."""
+        m1, m2, L1, L2, g = self.m1, self.m2, self.L1, self.L2, self.g
+        d = theta1 - theta2
+        sin_d = math.sin(d)
+        cos_d = math.cos(d)
+        den = 2 * m1 + m2 - m2 * math.cos(2 * d)
+
+        alpha1 = (
+            -g * (2 * m1 + m2) * math.sin(theta1)
+            - m2 * g * math.sin(theta1 - 2 * theta2)
+            - 2 * sin_d * m2 * (omega2 * omega2 * L2 + omega1 * omega1 * L1 * cos_d)
+        ) / (L1 * den)
+
+        alpha2 = (
+            2 * sin_d * (
+                omega1 * omega1 * L1 * (m1 + m2)
+                + g * (m1 + m2) * math.cos(theta1)
+                + omega2 * omega2 * L2 * m2 * cos_d
+            )
+        ) / (L2 * den)
+
+        # Apply damping
+        alpha1 -= self.damping * omega1
+        alpha2 -= self.damping * omega2
+
+        return omega1, omega2, alpha1, alpha2
+
+    def _step_rk4(self, theta1: float, theta2: float, omega1: float, omega2: float) -> tuple[float, float, float, float]:
+        """4th-order Runge-Kutta integration step."""
+        dt = self.dt
+
+        k1 = self._derivs(theta1, theta2, omega1, omega2)
+        k2 = self._derivs(
+            theta1 + dt / 2 * k1[0], theta2 + dt / 2 * k1[1],
+            omega1 + dt / 2 * k1[2], omega2 + dt / 2 * k1[3])
+        k3 = self._derivs(
+            theta1 + dt / 2 * k2[0], theta2 + dt / 2 * k2[1],
+            omega1 + dt / 2 * k2[2], omega2 + dt / 2 * k2[3])
+        k4 = self._derivs(
+            theta1 + dt * k3[0], theta2 + dt * k3[1],
+            omega1 + dt * k3[2], omega2 + dt * k3[3])
+
+        theta1 += dt / 6 * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0])
+        theta2 += dt / 6 * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1])
+        omega1 += dt / 6 * (k1[2] + 2 * k2[2] + 2 * k3[2] + k4[2])
+        omega2 += dt / 6 * (k1[3] + 2 * k2[3] + 2 * k3[3] + k4[3])
+
+        return theta1, theta2, omega1, omega2
+
+    def _bob_positions(self, theta1: float, theta2: float) -> tuple[float, float, float, float]:
+        """Get (x1, y1, x2, y2) positions of both bobs."""
+        x1 = self.L1 * math.sin(theta1)
+        y1 = self.L1 * math.cos(theta1)
+        x2 = x1 + self.L2 * math.sin(theta2)
+        y2 = y1 + self.L2 * math.cos(theta2)
+        return x1, y1, x2, y2
+
+    def _to_screen(self, x: float, y: float, cx: int, cy: int, scale: float) -> tuple[int, int]:
+        """Convert physics coords to screen coords. cx, cy = pivot screen position."""
+        sc = cx + int(x * scale)
+        sr = cy + int(y * scale)
+        return sr, sc
+
+    def tick(self) -> None:
+        if self.paused:
+            return
+
+        for _ in range(self.steps_per_tick):
+            self.a_theta1, self.a_theta2, self.a_omega1, self.a_omega2 = self._step_rk4(
+                self.a_theta1, self.a_theta2, self.a_omega1, self.a_omega2)
+            self.b_theta1, self.b_theta2, self.b_omega1, self.b_omega2 = self._step_rk4(
+                self.b_theta1, self.b_theta2, self.b_omega1, self.b_omega2)
+            self.total_steps += 1
+
+    def divergence(self) -> float:
+        """Angular divergence between the two pendulums."""
+        d1 = abs(self.a_theta1 - self.b_theta1)
+        d2 = abs(self.a_theta2 - self.b_theta2)
+        return d1 + d2
+
+    @property
+    def stats(self) -> dict:
+        preset_name = DOUBLE_PENDULUM_PRESET_NAMES[self.preset_idx]
+        return {
+            "preset": preset_name,
+            "m1": self.m1, "m2": self.m2,
+            "L1": self.L1, "L2": self.L2,
+            "damping": self.damping,
+            "delta": self.delta,
+            "steps": self.total_steps,
+            "divergence": self.divergence(),
+        }
+
+
 class SIRWorld:
     """Epidemic SIR (Susceptible-Infected-Recovered) grid simulation."""
 
@@ -6287,6 +6502,11 @@ class App:
         self.attractor_world: AttractorWorld | None = None
         self.attractor_gen = 0
         self.attractor_preset_idx = 0
+        # Double Pendulum mode
+        self.pendulum_mode = False
+        self.pendulum_world: DoublePendulumWorld | None = None
+        self.pendulum_gen = 0
+        self.pendulum_preset_idx = 0
         # Demo Tour (screensaver) state
         self.demo_tour_mode = False
         self.demo_tour_idx = 0          # current index into MENU_MODES
@@ -6330,6 +6550,7 @@ class App:
             # --- Mathematics ---
             ("Mathematics", "Fractal Explorer (Z)", "Interactive Mandelbrot & Julia set explorer with zoom/pan", "_start_fractal"),
             ("Mathematics", "Strange Attractors (A)", "Lorenz, Rössler & Hénon chaotic attractor visualization", "_start_attractor"),
+            ("Physics", "Double Pendulum (O)", "Chaotic double pendulum with divergence visualization", "_start_pendulum"),
         ]
         # Precompute category boundaries for menu rendering
         self._menu_categories: list[str] = []
@@ -6431,6 +6652,8 @@ class App:
                 self._fractal_tick()
             elif self.attractor_mode:
                 self._attractor_tick()
+            elif self.pendulum_mode:
+                self._pendulum_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -6791,6 +7014,10 @@ class App:
         if self.attractor_mode:
             return self._handle_attractor_input(key)
 
+        # Double Pendulum mode has its own input handler
+        if self.pendulum_mode:
+            return self._handle_pendulum_input(key)
+
         # Maze mode has its own input handler
         if self.maze_mode:
             return self._handle_maze_input(key)
@@ -7058,6 +7285,10 @@ class App:
         # Strange Attractor mode
         elif key == ord("A"):
             self._start_attractor()
+
+        # Double Pendulum mode
+        elif key == ord("O"):
+            self._start_pendulum()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -12022,6 +12253,271 @@ class App:
             except curses.error:
                 pass
 
+    # --- Double Pendulum mode ---
+
+    def _handle_pendulum_input(self, key: int) -> bool:
+        """Handle input while in Double Pendulum mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord("p"):
+            if self.pendulum_world:
+                name = self.pendulum_world.cycle_preset(-1)
+                self.pendulum_preset_idx = self.pendulum_world.preset_idx
+                self._set_message(f"Preset: {name}")
+        elif key == ord("n"):
+            if self.pendulum_world:
+                name = self.pendulum_world.cycle_preset(1)
+                self.pendulum_preset_idx = self.pendulum_world.preset_idx
+                self._set_message(f"Preset: {name}")
+        elif key == ord("r"):
+            if self.pendulum_world:
+                self.pendulum_world.reset()
+                self.pendulum_gen = 0
+                self._set_message("Reset")
+        elif key == ord(" "):
+            if self.pendulum_world:
+                self.pendulum_world.paused = not self.pendulum_world.paused
+                self._set_message(f"{'Paused' if self.pendulum_world.paused else 'Running'}")
+        elif key == ord("t"):
+            if self.pendulum_world:
+                self.pendulum_world.show_trail = not self.pendulum_world.show_trail
+                self._set_message(f"Trail: {'ON' if self.pendulum_world.show_trail else 'OFF'}")
+        elif key == ord("d"):
+            if self.pendulum_world:
+                pw = self.pendulum_world
+                if pw.damping > 0:
+                    pw.damping = 0.0
+                    self._set_message("Damping: OFF")
+                else:
+                    pw.damping = 0.02
+                    self._set_message("Damping: ON (0.02)")
+        elif key == ord("+") or key == ord("="):
+            if self.pendulum_world:
+                pw = self.pendulum_world
+                pw.delta = min(1.0, pw.delta * 2)
+                pw.reset()
+                self._set_message(f"Δ = {pw.delta:.6f}")
+        elif key == ord("-"):
+            if self.pendulum_world:
+                pw = self.pendulum_world
+                pw.delta = max(1e-8, pw.delta / 2)
+                pw.reset()
+                self._set_message(f"Δ = {pw.delta:.6f}")
+        elif key == ord("O") or key == 27:  # Shift+O or ESC to exit
+            self._stop_pendulum()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_pendulum(self) -> None:
+        """Enter Double Pendulum simulation mode."""
+        self.pendulum_mode = True
+        self.pendulum_gen = 0
+        preset = DOUBLE_PENDULUM_PRESET_NAMES[self.pendulum_preset_idx]
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(4, max_w // 2)
+        h = max(4, max_h - 3)
+        self.pendulum_world = DoublePendulumWorld(w, h, preset=preset)
+        self.running = True
+        self._set_message(
+            "Double Pendulum — [P/N]Preset [Space]Pause [T]rail [D]amping [+/-]Delta [R]eset [Shift+O]Exit"
+        )
+
+    def _stop_pendulum(self) -> None:
+        """Exit Double Pendulum mode."""
+        self.pendulum_mode = False
+        self.running = False
+        self.pendulum_world = None
+        self.pendulum_gen = 0
+        self._set_message("Double Pendulum mode ended")
+
+    def _pendulum_tick(self) -> None:
+        """Advance one double pendulum simulation step."""
+        if self.pendulum_world:
+            self.pendulum_world.tick()
+            self.pendulum_gen += 1
+
+            # Record trail points (screen coords computed during draw)
+            pw = self.pendulum_world
+            max_h, max_w = self.stdscr.getmaxyx()
+            mid_x = max_w // 2
+            quarter = mid_x // 2
+            scale = min(max_h - 5, mid_x // 2) / (pw.L1 + pw.L2) * 0.8
+
+            # Pendulum A trail (left half)
+            _, _, ax2, ay2 = pw._bob_positions(pw.a_theta1, pw.a_theta2)
+            ar, ac = pw._to_screen(ax2, ay2, quarter, 3, scale)
+            pw.trail_a.append((ar, ac))
+            if len(pw.trail_a) > pw.trail_len:
+                pw.trail_a = pw.trail_a[-pw.trail_len:]
+
+            # Pendulum B trail (right half)
+            _, _, bx2, by2 = pw._bob_positions(pw.b_theta1, pw.b_theta2)
+            br, bc = pw._to_screen(bx2, by2, mid_x + quarter, 3, scale)
+            pw.trail_b.append((br, bc))
+            if len(pw.trail_b) > pw.trail_len:
+                pw.trail_b = pw.trail_b[-pw.trail_len:]
+
+    def _draw_pendulum_line(self, r1: int, c1: int, r2: int, c2: int, ch: str, attr: int, max_h: int, max_w: int) -> None:
+        """Draw a line between two screen coordinates using Bresenham's algorithm."""
+        dr = abs(r2 - r1)
+        dc = abs(c2 - c1)
+        sr = 1 if r1 < r2 else -1
+        sc = 1 if c1 < c2 else -1
+        err = dc - dr
+        r, c = r1, c1
+        while True:
+            if 0 <= r < max_h - 2 and 0 <= c < max_w - 1:
+                try:
+                    self.stdscr.addstr(r, c, ch, attr)
+                except curses.error:
+                    pass
+            if r == r2 and c == c2:
+                break
+            e2 = 2 * err
+            if e2 > -dr:
+                err -= dr
+                c += sc
+            if e2 < dc:
+                err += dc
+                r += sr
+
+    def _draw_pendulum(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the Double Pendulum visualization."""
+        if not self.pendulum_world:
+            return
+        pw = self.pendulum_world
+
+        mid_x = max_w // 2
+        quarter = mid_x // 2
+        scale = min(max_h - 5, mid_x // 2) / (pw.L1 + pw.L2) * 0.8
+        pivot_row = 3
+
+        # Draw divider line
+        div_attr = curses.A_DIM
+        for r in range(max_h - 2):
+            try:
+                self.stdscr.addstr(r, mid_x, "│", div_attr)
+            except curses.error:
+                pass
+
+        # Labels
+        label_a_attr = curses.color_pair(4) | curses.A_BOLD if self.use_color else curses.A_BOLD
+        label_b_attr = curses.color_pair(2) | curses.A_BOLD if self.use_color else curses.A_BOLD
+        try:
+            self.stdscr.addstr(0, quarter - 6, "Pendulum A", label_a_attr)
+            self.stdscr.addstr(0, mid_x + quarter - 6, "Pendulum B", label_b_attr)
+        except curses.error:
+            pass
+
+        # Draw trails
+        if pw.show_trail:
+            for idx, (tr, tc) in enumerate(pw.trail_a):
+                if 0 <= tr < max_h - 2 and 0 <= tc < mid_x - 1:
+                    age = len(pw.trail_a) - idx
+                    if age < 50:
+                        attr = curses.color_pair(4) | curses.A_BOLD if self.use_color else curses.A_BOLD
+                        ch = "●"
+                    elif age < 200:
+                        attr = curses.color_pair(4) if self.use_color else curses.A_NORMAL
+                        ch = "∙"
+                    else:
+                        attr = curses.A_DIM
+                        ch = "·"
+                    try:
+                        self.stdscr.addstr(tr, tc, ch, attr)
+                    except curses.error:
+                        pass
+
+            for idx, (tr, tc) in enumerate(pw.trail_b):
+                if 0 <= tr < max_h - 2 and tc > mid_x and tc < max_w - 1:
+                    age = len(pw.trail_b) - idx
+                    if age < 50:
+                        attr = curses.color_pair(2) | curses.A_BOLD if self.use_color else curses.A_BOLD
+                        ch = "●"
+                    elif age < 200:
+                        attr = curses.color_pair(2) if self.use_color else curses.A_NORMAL
+                        ch = "∙"
+                    else:
+                        attr = curses.A_DIM
+                        ch = "·"
+                    try:
+                        self.stdscr.addstr(tr, tc, ch, attr)
+                    except curses.error:
+                        pass
+
+        # Draw pendulum A (left half)
+        ax1, ay1, ax2, ay2 = pw._bob_positions(pw.a_theta1, pw.a_theta2)
+        a_pivot_c = quarter
+        a_j1r, a_j1c = pw._to_screen(ax1, ay1, a_pivot_c, pivot_row, scale)
+        a_j2r, a_j2c = pw._to_screen(ax2, ay2, a_pivot_c, pivot_row, scale)
+
+        arm_attr_a = curses.color_pair(4) | curses.A_BOLD if self.use_color else curses.A_BOLD
+        self._draw_pendulum_line(pivot_row, a_pivot_c, a_j1r, a_j1c, "─", arm_attr_a, max_h, mid_x)
+        self._draw_pendulum_line(a_j1r, a_j1c, a_j2r, a_j2c, "─", arm_attr_a, max_h, mid_x)
+
+        # Draw bobs for A
+        bob_attr_a = curses.color_pair(4) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+        for ch, br, bc in [("◉", pivot_row, a_pivot_c), ("●", a_j1r, a_j1c), ("●", a_j2r, a_j2c)]:
+            if 0 <= br < max_h - 2 and 0 <= bc < mid_x - 1:
+                try:
+                    self.stdscr.addstr(br, bc, ch, bob_attr_a)
+                except curses.error:
+                    pass
+
+        # Draw pendulum B (right half)
+        bx1, by1, bx2, by2 = pw._bob_positions(pw.b_theta1, pw.b_theta2)
+        b_pivot_c = mid_x + quarter
+        b_j1r, b_j1c = pw._to_screen(bx1, by1, b_pivot_c, pivot_row, scale)
+        b_j2r, b_j2c = pw._to_screen(bx2, by2, b_pivot_c, pivot_row, scale)
+
+        arm_attr_b = curses.color_pair(2) | curses.A_BOLD if self.use_color else curses.A_BOLD
+        self._draw_pendulum_line(pivot_row, b_pivot_c, b_j1r, b_j1c, "─", arm_attr_b, max_h, max_w)
+        self._draw_pendulum_line(b_j1r, b_j1c, b_j2r, b_j2c, "─", arm_attr_b, max_h, max_w)
+
+        # Draw bobs for B
+        bob_attr_b = curses.color_pair(2) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+        for ch, br, bc in [("◉", pivot_row, b_pivot_c), ("●", b_j1r, b_j1c), ("●", b_j2r, b_j2c)]:
+            if 0 <= br < max_h - 2 and bc > mid_x and bc < max_w - 1:
+                try:
+                    self.stdscr.addstr(br, bc, ch, bob_attr_b)
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            st = pw.stats
+            status = (
+                f" Double Pendulum | {st['preset']} | "
+                f"m₁={st['m1']:.1f} m₂={st['m2']:.1f} L₁={st['L1']:.1f} L₂={st['L2']:.1f} | "
+                f"Δ={st['delta']:.1e} | Divergence: {st['divergence']:.4f} | "
+                f"Steps: {st['steps']} "
+            )
+            if pw.damping > 0:
+                status += f"| Damp: {pw.damping:.3f} "
+            if pw.paused:
+                status += "| PAUSED "
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [P/N]Preset [Space]Pause [T]rail [D]amping [+/-]Delta [R]eset [Shift+O]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -12393,6 +12889,8 @@ class App:
             self._draw_fractal(max_h, max_w, grid_rows, grid_cols)
         elif self.attractor_mode:
             self._draw_attractor(max_h, max_w, grid_rows, grid_cols)
+        elif self.pendulum_mode:
+            self._draw_pendulum(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
@@ -13225,6 +13723,8 @@ class App:
             self._stop_fractal()
         elif self.attractor_mode:
             self._stop_attractor()
+        elif self.pendulum_mode:
+            self._stop_pendulum()
         elif self.split_mode:
             self._stop_split()
         elif self.evolve_mode:
