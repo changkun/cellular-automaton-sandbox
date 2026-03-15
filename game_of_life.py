@@ -1460,6 +1460,202 @@ class LeniaGrid:
 
 
 # ---------------------------------------------------------------------------
+# Physarum (slime mold) simulation
+# ---------------------------------------------------------------------------
+
+# Preset configurations: (sensor_angle, sensor_distance, turn_angle, deposit, decay, diffuse_k)
+PHYSARUM_PRESETS = {
+    "network": (math.pi / 4, 9.0, math.pi / 4, 5.0, 0.1, 0.9),
+    "ring": (math.pi / 8, 15.0, math.pi / 4, 3.0, 0.05, 0.95),
+    "maze-solver": (math.pi / 3, 5.0, math.pi / 6, 8.0, 0.15, 0.85),
+    "tendrils": (math.pi / 6, 12.0, math.pi / 3, 4.0, 0.08, 0.92),
+    "dense": (math.pi / 2, 7.0, math.pi / 2, 6.0, 0.12, 0.88),
+}
+PHYSARUM_PRESET_NAMES = list(PHYSARUM_PRESETS.keys())
+
+# Graded trail rendering characters (low → high concentration)
+PHYSARUM_SHADES = " .·:░▒▓█"
+
+
+class PhysarumWorld:
+    """Physarum polycephalum (slime mold) agent-based simulation.
+
+    Thousands of simple agents move, sense chemical trails, and deposit
+    pheromones — producing stunning emergent network structures that
+    resemble veins, transit maps, and neural pathways.
+
+    Each agent has a position and heading.  On every tick it:
+      1. Senses the trail map at three forward positions (left, center, right)
+      2. Rotates toward the strongest signal
+      3. Moves one step forward
+      4. Deposits pheromone at its new position
+
+    The trail map then diffuses and decays, producing smooth gradients
+    that guide subsequent agent movement (stigmergy).
+    """
+
+    def __init__(self, width: int, height: int, n_agents: int = 0,
+                 preset: str = "network"):
+        self.width = width
+        self.height = height
+        # Default agent count scales with grid size
+        self.n_agents = n_agents if n_agents > 0 else max(500, width * height // 4)
+        self.preset_idx = PHYSARUM_PRESET_NAMES.index(preset)
+
+        # Agent state: position (continuous), heading (radians)
+        self.ax: list[float] = []
+        self.ay: list[float] = []
+        self.ah: list[float] = []  # heading in radians
+
+        # Trail map (continuous values, same resolution as display)
+        self.trail: list[list[float]] = [[0.0] * width for _ in range(height)]
+
+        # Apply preset parameters
+        self._apply_preset(preset)
+        self.seed()
+
+    def _apply_preset(self, name: str) -> None:
+        """Load parameters from a named preset."""
+        sa, sd, ta, dep, dec, dk = PHYSARUM_PRESETS[name]
+        self.sensor_angle = sa       # angle offset of left/right sensors
+        self.sensor_dist = sd        # distance of sensor from agent
+        self.turn_angle = ta         # rotation step when turning
+        self.deposit_amount = dep    # pheromone deposited per step
+        self.decay_rate = dec        # fraction of trail lost per tick
+        self.diffuse_k = dk          # diffusion kernel weight (0-1)
+        self.step_size = 1.0         # movement speed per tick
+
+    def seed(self) -> None:
+        """Place agents randomly across the world."""
+        self.ax = [random.uniform(0, self.width - 1) for _ in range(self.n_agents)]
+        self.ay = [random.uniform(0, self.height - 1) for _ in range(self.n_agents)]
+        self.ah = [random.uniform(0, 2 * math.pi) for _ in range(self.n_agents)]
+        # Clear trail
+        self.trail = [[0.0] * self.width for _ in range(self.height)]
+
+    def seed_ring(self) -> None:
+        """Place agents in a ring formation pointing inward."""
+        cx, cy = self.width / 2, self.height / 2
+        radius = min(cx, cy) * 0.7
+        self.ax = []
+        self.ay = []
+        self.ah = []
+        for i in range(self.n_agents):
+            angle = 2 * math.pi * i / self.n_agents
+            x = cx + radius * math.cos(angle)
+            y = cy + radius * math.sin(angle)
+            self.ax.append(x % self.width)
+            self.ay.append(y % self.height)
+            # Point inward (toward center)
+            self.ah.append(angle + math.pi)
+        self.trail = [[0.0] * self.width for _ in range(self.height)]
+
+    def seed_center(self) -> None:
+        """Place all agents at center pointing outward."""
+        cx, cy = self.width / 2, self.height / 2
+        self.ax = [cx + random.gauss(0, 2) for _ in range(self.n_agents)]
+        self.ay = [cy + random.gauss(0, 2) for _ in range(self.n_agents)]
+        self.ah = [random.uniform(0, 2 * math.pi) for _ in range(self.n_agents)]
+        self.trail = [[0.0] * self.width for _ in range(self.height)]
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        """Switch to next/prev preset and return name."""
+        self.preset_idx = (self.preset_idx + direction) % len(PHYSARUM_PRESET_NAMES)
+        name = PHYSARUM_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        return name
+
+    def _sense(self, x: float, y: float, heading: float, offset_angle: float) -> float:
+        """Sample trail intensity at a sensor position."""
+        sx = x + self.sensor_dist * math.cos(heading + offset_angle)
+        sy = y + self.sensor_dist * math.sin(heading + offset_angle)
+        # Wrap toroidally
+        ix = int(sx) % self.width
+        iy = int(sy) % self.height
+        return self.trail[iy][ix]
+
+    def tick(self) -> None:
+        """Advance one simulation step: sense-rotate-move-deposit then diffuse-decay."""
+        w = self.width
+        h = self.height
+        sa = self.sensor_angle
+        ta = self.turn_angle
+        step = self.step_size
+
+        # Phase 1: sense, rotate, move, deposit for each agent
+        for i in range(self.n_agents):
+            x, y, heading = self.ax[i], self.ay[i], self.ah[i]
+
+            # Sense left, center, right
+            sl = self._sense(x, y, heading, -sa)
+            sc = self._sense(x, y, heading, 0.0)
+            sr = self._sense(x, y, heading, sa)
+
+            # Rotate based on sensor readings
+            if sc >= sl and sc >= sr:
+                pass  # keep heading (center is strongest)
+            elif sl > sr:
+                heading -= ta  # turn left
+            elif sr > sl:
+                heading += ta  # turn right
+            else:
+                # sl == sr and both > sc: random turn
+                heading += ta if random.random() < 0.5 else -ta
+
+            # Move forward
+            nx = (x + step * math.cos(heading)) % w
+            ny = (y + step * math.sin(heading)) % h
+
+            self.ax[i] = nx
+            self.ay[i] = ny
+            self.ah[i] = heading
+
+            # Deposit pheromone
+            ix = int(nx) % w
+            iy = int(ny) % h
+            self.trail[iy][ix] += self.deposit_amount
+
+        # Phase 2: diffuse and decay trail map
+        self._diffuse_decay()
+
+    def _diffuse_decay(self) -> None:
+        """Apply 3x3 mean-filter diffusion and multiplicative decay to the trail."""
+        w = self.width
+        h = self.height
+        old = self.trail
+        dk = self.diffuse_k
+        inv_dk = 1.0 - dk
+        decay_mult = 1.0 - self.decay_rate
+        new = [[0.0] * w for _ in range(h)]
+
+        for r in range(h):
+            rp = (r - 1) % h
+            rn = (r + 1) % h
+            for c in range(w):
+                cp = (c - 1) % w
+                cn = (c + 1) % w
+                # 3x3 mean
+                avg = (
+                    old[rp][cp] + old[rp][c] + old[rp][cn] +
+                    old[r][cp] + old[r][c] + old[r][cn] +
+                    old[rn][cp] + old[rn][c] + old[rn][cn]
+                ) / 9.0
+                # Blend original with diffused, then decay
+                new[r][c] = (inv_dk * old[r][c] + dk * avg) * decay_mult
+
+        self.trail = new
+
+    def max_trail(self) -> float:
+        """Return the maximum trail value (for normalization)."""
+        mx = 0.0
+        for row in self.trail:
+            for v in row:
+                if v > mx:
+                    mx = v
+        return mx
+
+
+# ---------------------------------------------------------------------------
 # Pattern detector — identifies known still lifes, oscillators, spaceships
 # ---------------------------------------------------------------------------
 
@@ -1991,6 +2187,11 @@ class App:
         self.eco_mode = False
         self.eco_world: WaTorWorld | None = None
         self.eco_gen = 0
+        # Physarum (slime mold) mode
+        self.physarum_mode = False
+        self.physarum_world: PhysarumWorld | None = None
+        self.physarum_gen = 0
+        self.physarum_preset_idx = 0
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -2028,6 +2229,9 @@ class App:
             elif self.eco_mode:
                 if self.running:
                     self._eco_tick()
+            elif self.physarum_mode:
+                if self.running:
+                    self._physarum_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -2110,6 +2314,12 @@ class App:
             # Wa-Tor Ecosystem colors
             curses.init_pair(45, curses.COLOR_GREEN, -1)   # Fish
             curses.init_pair(46, curses.COLOR_RED, -1)     # Shark
+            # Physarum trail gradient (dark → bright organic greens/yellows)
+            curses.init_pair(47, curses.COLOR_BLUE, -1)    # Physarum: trace
+            curses.init_pair(48, curses.COLOR_CYAN, -1)    # Physarum: low
+            curses.init_pair(49, curses.COLOR_GREEN, -1)   # Physarum: mid
+            curses.init_pair(50, curses.COLOR_YELLOW, -1)  # Physarum: high
+            curses.init_pair(51, curses.COLOR_WHITE, -1)   # Physarum: peak
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -2180,6 +2390,10 @@ class App:
         # Wa-Tor Ecosystem mode has its own input handler
         if self.eco_mode:
             return self._handle_eco_input(key)
+
+        # Physarum (slime mold) mode has its own input handler
+        if self.physarum_mode:
+            return self._handle_physarum_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -2376,6 +2590,10 @@ class App:
         # Ecosystem (Wa-Tor) mode
         elif key == ord("E"):
             self._start_eco()
+
+        # Physarum (slime mold) mode
+        elif key == ord("S"):
+            self._start_physarum()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -3818,6 +4036,190 @@ class App:
             except curses.error:
                 pass
 
+    # --- Physarum (slime mold) mode ---
+
+    def _handle_physarum_input(self, key: int) -> bool:
+        """Handle input while in Physarum mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            if not self.running:
+                self._physarum_tick()
+        elif key == ord("r"):
+            if self.physarum_world:
+                self.physarum_world.seed()
+                self.physarum_gen = 0
+                self._set_message("Agents scattered randomly")
+        elif key == ord("c"):
+            if self.physarum_world:
+                self.physarum_world.seed()
+                self.physarum_gen = 0
+                self._set_message("Cleared & reset")
+        # Cycle preset forward
+        elif key == ord("p") or key == ord("n"):
+            if self.physarum_world:
+                direction = 1 if key == ord("n") else -1
+                name = self.physarum_world.cycle_preset(direction)
+                self.physarum_preset_idx = self.physarum_world.preset_idx
+                self._set_message(f"Preset: {name}")
+        # Seed patterns
+        elif key == ord("1"):
+            if self.physarum_world:
+                self.physarum_world.seed()
+                self.physarum_gen = 0
+                self._set_message("Seed: random scatter")
+        elif key == ord("2"):
+            if self.physarum_world:
+                self.physarum_world.seed_ring()
+                self.physarum_gen = 0
+                self._set_message("Seed: ring inward")
+        elif key == ord("3"):
+            if self.physarum_world:
+                self.physarum_world.seed_center()
+                self.physarum_gen = 0
+                self._set_message("Seed: center burst")
+        # Adjust deposit amount
+        elif key == ord("]") or key == ord("+") or key == ord("="):
+            if self.physarum_world:
+                self.physarum_world.deposit_amount = min(
+                    20.0, self.physarum_world.deposit_amount + 0.5
+                )
+                self._set_message(f"Deposit: {self.physarum_world.deposit_amount:.1f}")
+        elif key == ord("[") or key == ord("-") or key == ord("_"):
+            if self.physarum_world:
+                self.physarum_world.deposit_amount = max(
+                    0.5, self.physarum_world.deposit_amount - 0.5
+                )
+                self._set_message(f"Deposit: {self.physarum_world.deposit_amount:.1f}")
+        # Adjust decay rate
+        elif key == ord("d"):
+            if self.physarum_world:
+                self.physarum_world.decay_rate = min(
+                    0.5, self.physarum_world.decay_rate + 0.01
+                )
+                self._set_message(f"Decay: {self.physarum_world.decay_rate:.2f}")
+        elif key == ord("f"):
+            if self.physarum_world:
+                self.physarum_world.decay_rate = max(
+                    0.01, self.physarum_world.decay_rate - 0.01
+                )
+                self._set_message(f"Decay: {self.physarum_world.decay_rate:.2f}")
+        # Speed control
+        elif key == ord(">"):
+            self.speed = min(20, self.speed + 1)
+            self._update_timeout()
+        elif key == ord("<"):
+            self.speed = max(1, self.speed - 1)
+            self._update_timeout()
+        # Exit Physarum mode
+        elif key == ord("S") or key == 27:
+            self._stop_physarum()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_physarum(self) -> None:
+        """Enter Physarum (slime mold) mode."""
+        self.running = False
+        self.physarum_mode = True
+        self.physarum_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(1, max_w // 2)  # each cell rendered as 2 chars wide
+        h = max(1, max_h - 3)
+        preset = PHYSARUM_PRESET_NAMES[self.physarum_preset_idx]
+        self.physarum_world = PhysarumWorld(w, h, preset=preset)
+        self._set_message(
+            "Physarum Slime Mold — [Space]Run [S]tep [S]hift+S Exit"
+        )
+
+    def _stop_physarum(self) -> None:
+        """Exit Physarum mode."""
+        self.physarum_mode = False
+        self.running = False
+        self.physarum_world = None
+        self.physarum_gen = 0
+        self._set_message("Physarum mode ended")
+
+    def _physarum_tick(self) -> None:
+        """Advance one Physarum generation."""
+        if self.physarum_world:
+            self.physarum_world.tick()
+            self.physarum_gen += 1
+
+    def _draw_physarum(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the Physarum trail map with graded characters."""
+        if not self.physarum_world:
+            return
+        pw = self.physarum_world
+        shades = PHYSARUM_SHADES
+        n_shades = len(shades)
+
+        # Find max trail value for normalization
+        mx = pw.max_trail()
+        if mx < 0.001:
+            mx = 1.0
+
+        # Color tiers mapped to shade index
+        # shades: 0=space, 1=., 2=·, 3=:, 4=░, 5=▒, 6=▓, 7=█
+        color_tiers = [0, 47, 47, 48, 48, 49, 50, 51]
+
+        for r in range(min(grid_rows, pw.height)):
+            for c in range(min(grid_cols, pw.width)):
+                v = pw.trail[r][c]
+                # Map to shade index
+                idx = int((v / mx) * (n_shades - 1))
+                idx = max(0, min(n_shades - 1, idx))
+                ch = shades[idx]
+                if idx == 0:
+                    continue  # skip empty cells
+                sc = c * 2  # screen column (double-wide)
+                if sc + 1 >= max_w:
+                    break
+                pair = color_tiers[idx]
+                attr = curses.color_pair(pair) if self.use_color and pair > 0 else 0
+                if idx >= n_shades - 2:
+                    attr |= curses.A_BOLD
+                try:
+                    self.stdscr.addstr(r, sc, ch * 2, attr)
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            preset_name = PHYSARUM_PRESET_NAMES[pw.preset_idx]
+            state_str = "RUNNING" if self.running else "PAUSED"
+            status = (
+                f" Physarum | Gen: {self.physarum_gen} | "
+                f"Agents: {pw.n_agents} | "
+                f"Preset: {preset_name} | "
+                f"Deposit: {pw.deposit_amount:.1f} Decay: {pw.decay_rate:.2f} | "
+                f"Speed: {self.speed} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset | "
+                "[P/N]Preset [1]Random [2]Ring [3]Center | "
+                "[+/-]Deposit [D/F]Decay [</>]Spd | [Shift+S]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -4153,6 +4555,8 @@ class App:
             self._draw_pl(max_h, max_w, grid_rows, grid_cols)
         elif self.eco_mode:
             self._draw_eco(max_h, max_w, grid_rows, grid_cols)
+        elif self.physarum_mode:
+            self._draw_physarum(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
