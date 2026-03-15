@@ -2557,6 +2557,277 @@ class NCAWorld:
 
 
 # ---------------------------------------------------------------------------
+# Wave Function Collapse (WFC) terrain generation
+# ---------------------------------------------------------------------------
+
+# Tile definitions: each tile has a character, color, and allowed adjacencies
+# Tiles: water, sand, grass, forest, mountain, snow
+WFC_TILES = {
+    0: {"name": "water",    "char": "≈≈", "color_id": 80},
+    1: {"name": "sand",     "char": "··", "color_id": 81},
+    2: {"name": "grass",    "char": "░░", "color_id": 82},
+    3: {"name": "forest",   "char": "▓▓", "color_id": 83},
+    4: {"name": "mountain", "char": "▲▲", "color_id": 84},
+    5: {"name": "snow",     "char": "██", "color_id": 85},
+}
+NUM_WFC_TILES = len(WFC_TILES)
+
+# Adjacency rules: which tiles can be next to each other
+# Format: tile_id -> set of allowed neighbor tile_ids
+WFC_ADJACENCY = {
+    0: {0, 1},          # water: water, sand
+    1: {0, 1, 2},       # sand: water, sand, grass
+    2: {1, 2, 3},       # grass: sand, grass, forest
+    3: {2, 3, 4},       # forest: grass, forest, mountain
+    4: {3, 4, 5},       # mountain: forest, mountain, snow
+    5: {4, 5},          # snow: mountain, snow
+}
+
+WFC_PRESETS = {
+    "terrain": (
+        WFC_ADJACENCY,
+        None,  # no weight bias
+        "Terrain — water/sand/grass/forest/mountain/snow",
+    ),
+    "islands": (
+        {
+            0: {0, 1},
+            1: {0, 1, 2},
+            2: {1, 2, 3},
+            3: {2, 3, 4},
+            4: {3, 4, 5},
+            5: {4, 5},
+        },
+        {0: 3.0, 1: 1.5, 2: 1.0, 3: 0.8, 4: 0.5, 5: 0.3},
+        "Islands — mostly water with scattered land",
+    ),
+    "highlands": (
+        {
+            0: {0, 1},
+            1: {0, 1, 2},
+            2: {1, 2, 3},
+            3: {2, 3, 4},
+            4: {3, 4, 5},
+            5: {4, 5},
+        },
+        {0: 0.3, 1: 0.5, 2: 1.0, 3: 1.5, 4: 2.5, 5: 2.0},
+        "Highlands — mountainous terrain with snow peaks",
+    ),
+    "coastal": (
+        {
+            0: {0, 1},
+            1: {0, 1, 2},
+            2: {1, 2, 3},
+            3: {2, 3, 4},
+            4: {3, 4, 5},
+            5: {4, 5},
+        },
+        {0: 2.0, 1: 2.0, 2: 2.0, 3: 1.0, 4: 0.3, 5: 0.1},
+        "Coastal — beaches and shallow waters",
+    ),
+    "checkerboard": (
+        {
+            0: {2, 4},
+            1: {3, 5},
+            2: {0, 4},
+            3: {1, 5},
+            4: {0, 2},
+            5: {1, 3},
+        },
+        None,
+        "Checkerboard — non-adjacent constraint pattern",
+    ),
+}
+WFC_PRESET_NAMES = list(WFC_PRESETS.keys())
+
+
+class WFCWorld:
+    """Wave Function Collapse procedural terrain generator.
+
+    Each cell starts in a superposition of all possible tile types.
+    The algorithm repeatedly:
+      1. Finds the cell with the lowest entropy (fewest possibilities).
+      2. Collapses it to a single tile (weighted random).
+      3. Propagates constraints to neighbors.
+
+    When run step-by-step, the user sees the terrain emerge progressively.
+    """
+
+    def __init__(self, width: int, height: int, preset: str = "terrain") -> None:
+        self.width = width
+        self.height = height
+        self.preset_idx = WFC_PRESET_NAMES.index(preset)
+        self._apply_preset(preset)
+        self.collapsed = 0
+        self.total_cells = width * height
+        self.contradiction = False
+        self.complete = False
+        self.steps_per_tick = 1  # how many cells to collapse per tick
+        self._reset_grid()
+
+    def _apply_preset(self, name: str) -> None:
+        adj, weights, self.description = WFC_PRESETS[name]
+        self.adjacency = adj
+        # Tile weights for biased generation
+        if weights is None:
+            self.weights = {i: 1.0 for i in range(NUM_WFC_TILES)}
+        else:
+            self.weights = dict(weights)
+
+    def _reset_grid(self) -> None:
+        """Initialize all cells to full superposition."""
+        all_tiles = frozenset(range(NUM_WFC_TILES))
+        self.grid: list[list[frozenset[int] | int]] = [
+            [all_tiles for _ in range(self.width)]
+            for _ in range(self.height)
+        ]
+        self.collapsed = 0
+        self.contradiction = False
+        self.complete = False
+
+    def reset(self) -> None:
+        self._reset_grid()
+
+    def cycle_preset(self, direction: int = 1) -> str:
+        self.preset_idx = (self.preset_idx + direction) % len(WFC_PRESET_NAMES)
+        name = WFC_PRESET_NAMES[self.preset_idx]
+        self._apply_preset(name)
+        self._reset_grid()
+        return name
+
+    def _entropy(self, y: int, x: int) -> float:
+        """Return entropy of a cell (number of possibilities). Collapsed = inf."""
+        cell = self.grid[y][x]
+        if isinstance(cell, int):
+            return float("inf")
+        n = len(cell)
+        if n == 0:
+            return float("inf")
+        return float(n)
+
+    def _find_min_entropy(self) -> tuple[int, int] | None:
+        """Find uncollapsed cell with minimum entropy (+ random tiebreak)."""
+        min_ent = float("inf")
+        candidates: list[tuple[int, int]] = []
+        for y in range(self.height):
+            for x in range(self.width):
+                cell = self.grid[y][x]
+                if isinstance(cell, int):
+                    continue
+                n = len(cell)
+                if n == 0:
+                    continue
+                # Add small noise for tiebreaking
+                ent = n + random.random() * 0.1
+                if ent < min_ent:
+                    min_ent = ent
+                    candidates = [(y, x)]
+                elif abs(ent - min_ent) < 0.5:
+                    candidates.append((y, x))
+        if not candidates:
+            return None
+        return random.choice(candidates)
+
+    def _collapse(self, y: int, x: int) -> bool:
+        """Collapse a cell to a single tile, weighted by tile weights."""
+        cell = self.grid[y][x]
+        if isinstance(cell, int):
+            return True
+        options = list(cell)
+        if not options:
+            self.contradiction = True
+            return False
+        # Weighted random selection
+        w = [self.weights.get(t, 1.0) for t in options]
+        total = sum(w)
+        if total <= 0:
+            chosen = random.choice(options)
+        else:
+            r = random.random() * total
+            cumulative = 0.0
+            chosen = options[-1]
+            for i, opt in enumerate(options):
+                cumulative += w[i]
+                if r <= cumulative:
+                    chosen = opt
+                    break
+        self.grid[y][x] = chosen
+        self.collapsed += 1
+        if self.collapsed >= self.total_cells:
+            self.complete = True
+        return True
+
+    def _propagate(self, start_y: int, start_x: int) -> bool:
+        """Propagate constraints from a collapsed cell using BFS."""
+        stack = [(start_y, start_x)]
+        visited = set()
+        while stack:
+            cy, cx = stack.pop()
+            if (cy, cx) in visited:
+                continue
+            visited.add((cy, cx))
+            cell = self.grid[cy][cx]
+            if isinstance(cell, int):
+                allowed_from_here = self.adjacency.get(cell, set())
+            else:
+                # Union of all adjacencies from possible tiles
+                allowed_from_here: set[int] = set()
+                for t in cell:
+                    allowed_from_here |= self.adjacency.get(t, set())
+
+            # Check 4 neighbors
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < self.height and 0 <= nx < self.width:
+                    ncell = self.grid[ny][nx]
+                    if isinstance(ncell, int):
+                        continue  # already collapsed
+                    # Also consider what neighbor allows back
+                    new_options = frozenset(
+                        t for t in ncell
+                        if t in allowed_from_here
+                        and cell_val_in_adj(self.adjacency, t, cell)
+                    )
+                    if new_options != ncell:
+                        if len(new_options) == 0:
+                            self.contradiction = True
+                            return False
+                        self.grid[ny][nx] = new_options
+                        stack.append((ny, nx))
+        return True
+
+    def tick(self) -> None:
+        """Perform one or more collapse steps."""
+        if self.complete or self.contradiction:
+            return
+        for _ in range(self.steps_per_tick):
+            if self.complete or self.contradiction:
+                break
+            pos = self._find_min_entropy()
+            if pos is None:
+                self.complete = True
+                break
+            y, x = pos
+            if not self._collapse(y, x):
+                break
+            if not self._propagate(y, x):
+                break
+
+    @property
+    def progress(self) -> float:
+        return self.collapsed / max(1, self.total_cells)
+
+
+def cell_val_in_adj(adjacency: dict, tile: int, cell) -> bool:
+    """Check if tile is allowed adjacent to cell value."""
+    allowed = adjacency.get(tile, set())
+    if isinstance(cell, int):
+        return cell in allowed
+    # cell is a frozenset — tile must be adjacent to at least one option
+    return bool(allowed & (cell if isinstance(cell, frozenset) else set(cell)))
+
+
+# ---------------------------------------------------------------------------
 # Pattern detector — identifies known still lifes, oscillators, spaceships
 # ---------------------------------------------------------------------------
 
@@ -3123,6 +3394,11 @@ class App:
         self.nca_painting = False   # True while painting cells
         self.nca_erasing = False    # True while erasing cells
         self.nca_brush_size = 2     # brush radius
+        # Wave Function Collapse (WFC) terrain generation mode
+        self.wfc_mode = False
+        self.wfc_world: WFCWorld | None = None
+        self.wfc_gen = 0
+        self.wfc_preset_idx = 0
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -3175,6 +3451,9 @@ class App:
             elif self.nca_mode:
                 if self.running:
                     self._nca_tick()
+            elif self.wfc_mode:
+                if self.running:
+                    self._wfc_tick()
             elif self.split_mode:
                 if self.running:
                     self._split_tick()
@@ -3287,6 +3566,14 @@ class App:
             curses.init_pair(73, curses.COLOR_WHITE, -1)   # NCA: full alpha
             curses.init_pair(74, curses.COLOR_MAGENTA, -1) # NCA: channel highlight
             curses.init_pair(75, curses.COLOR_RED, -1)     # NCA: cursor
+            # WFC terrain tile colors
+            curses.init_pair(80, curses.COLOR_BLUE, -1)    # WFC: water
+            curses.init_pair(81, curses.COLOR_YELLOW, -1)  # WFC: sand
+            curses.init_pair(82, curses.COLOR_GREEN, -1)   # WFC: grass
+            curses.init_pair(83, curses.COLOR_GREEN, -1)   # WFC: forest (bold)
+            curses.init_pair(84, curses.COLOR_RED, -1)     # WFC: mountain
+            curses.init_pair(85, curses.COLOR_WHITE, -1)   # WFC: snow
+            curses.init_pair(86, curses.COLOR_CYAN, -1)    # WFC: uncollapsed
 
     def _age_color_pair(self, age: int) -> int:
         """Return curses color pair number based on cell age."""
@@ -3377,6 +3664,10 @@ class App:
         # Neural Cellular Automata mode has its own input handler
         if self.nca_mode:
             return self._handle_nca_input(key)
+
+        # Wave Function Collapse mode has its own input handler
+        if self.wfc_mode:
+            return self._handle_wfc_input(key)
 
         # Split mode has limited input
         if self.split_mode:
@@ -3593,6 +3884,10 @@ class App:
         # Neural Cellular Automata mode
         elif key == ord("N"):
             self._start_nca()
+
+        # Wave Function Collapse terrain generation mode
+        elif key == ord("T"):
+            self._start_wfc()
 
         # Split-screen comparison mode
         elif key == ord("m"):
@@ -6077,6 +6372,168 @@ class App:
             except curses.error:
                 pass
 
+    # --- Wave Function Collapse (WFC) terrain generation ---
+
+    def _handle_wfc_input(self, key: int) -> bool:
+        """Handle input while in WFC mode."""
+        if key == ord("q"):
+            return False
+        elif key == ord(" "):
+            self.running = not self.running
+        elif key == ord("s"):
+            if not self.running:
+                self._wfc_tick()
+        elif key == ord("r"):
+            if self.wfc_world:
+                self.wfc_world.reset()
+                self.wfc_gen = 0
+                self._set_message("Reset WFC grid")
+        # Cycle presets
+        elif key == ord("p") or key == ord("n"):
+            if self.wfc_world:
+                direction = 1 if key == ord("n") else -1
+                name = self.wfc_world.cycle_preset(direction)
+                self.wfc_preset_idx = self.wfc_world.preset_idx
+                self.wfc_gen = 0
+                self._set_message(f"Preset: {name}")
+        # Adjust collapse speed
+        elif key == ord("]"):
+            if self.wfc_world:
+                self.wfc_world.steps_per_tick = min(50, self.wfc_world.steps_per_tick + 1)
+                self._set_message(f"Steps/tick: {self.wfc_world.steps_per_tick}")
+        elif key == ord("["):
+            if self.wfc_world:
+                self.wfc_world.steps_per_tick = max(1, self.wfc_world.steps_per_tick - 1)
+                self._set_message(f"Steps/tick: {self.wfc_world.steps_per_tick}")
+        # Speed control
+        elif key == ord("f"):
+            self.speed = min(20, self.speed + 1)
+            self._update_timeout()
+        elif key == ord("d"):
+            self.speed = max(1, self.speed - 1)
+            self._update_timeout()
+        # Exit WFC mode
+        elif key == ord("T") or key == 27:
+            self._stop_wfc()
+        elif key == curses.KEY_RESIZE:
+            pass
+        return True
+
+    def _start_wfc(self) -> None:
+        """Enter Wave Function Collapse terrain generation mode."""
+        self.running = False
+        self.wfc_mode = True
+        self.wfc_gen = 0
+        max_h, max_w = self.stdscr.getmaxyx()
+        w = max(10, max_w // 2)
+        h = max(10, max_h - 3)
+        preset = WFC_PRESET_NAMES[self.wfc_preset_idx]
+        self.wfc_world = WFCWorld(w, h, preset=preset)
+        self._set_message(
+            "WFC Terrain — [Space]Run [S]tep [R]eset [P/N]Preset [Shift+T]Exit"
+        )
+
+    def _stop_wfc(self) -> None:
+        """Exit Wave Function Collapse mode."""
+        self.wfc_mode = False
+        self.running = False
+        self.wfc_world = None
+        self.wfc_gen = 0
+        self._set_message("WFC mode ended")
+
+    def _wfc_tick(self) -> None:
+        """Advance one WFC generation."""
+        if self.wfc_world:
+            self.wfc_world.tick()
+            self.wfc_gen += 1
+
+    def _draw_wfc(self, max_h: int, max_w: int, grid_rows: int, grid_cols: int) -> None:
+        """Draw the Wave Function Collapse terrain."""
+        if not self.wfc_world:
+            return
+        ww = self.wfc_world
+
+        # Superposition display characters by count
+        # More options = more uncertain visual
+        sup_chars = "█▓▒░·"
+
+        for y in range(min(grid_rows, ww.height)):
+            for x in range(min(grid_cols, ww.width)):
+                cell = ww.grid[y][x]
+                sc = x * 2
+                if sc + 1 >= max_w or y >= grid_rows:
+                    continue
+
+                if isinstance(cell, int):
+                    # Collapsed — show the tile
+                    tile = WFC_TILES[cell]
+                    ch = tile["char"]
+                    if self.use_color:
+                        cid = tile["color_id"]
+                        attr = curses.color_pair(cid)
+                        # Bold for forest and snow
+                        if cell in (3, 5):
+                            attr |= curses.A_BOLD
+                    else:
+                        attr = curses.A_BOLD if cell >= 3 else 0
+                else:
+                    # Uncollapsed — show superposition
+                    n = len(cell)
+                    if n == 0:
+                        # Contradiction
+                        ch = "XX"
+                        attr = curses.color_pair(84) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+                    else:
+                        # Map possibility count to uncertainty visual
+                        idx = min(len(sup_chars) - 1, (n - 1) * len(sup_chars) // NUM_WFC_TILES)
+                        ch = sup_chars[idx] * 2
+                        if self.use_color:
+                            attr = curses.color_pair(86) | curses.A_DIM
+                        else:
+                            attr = curses.A_DIM
+
+                try:
+                    self.stdscr.addstr(y, sc, ch, attr)
+                except curses.error:
+                    pass
+
+        # Status bar
+        status_y = max_h - 2
+        if status_y > 0:
+            preset_name = WFC_PRESET_NAMES[ww.preset_idx]
+            state_str = "RUNNING" if self.running else "PAUSED"
+            if ww.complete:
+                state_str = "COMPLETE"
+            elif ww.contradiction:
+                state_str = "CONTRADICTION"
+            progress_pct = ww.progress * 100
+            status = (
+                f" WFC Terrain | Gen: {self.wfc_gen} | "
+                f"Progress: {progress_pct:.1f}% ({ww.collapsed}/{ww.total_cells}) | "
+                f"Steps/tick: {ww.steps_per_tick} | "
+                f"Preset: {preset_name} | Speed: {self.speed} | {state_str} "
+            )
+            if self.message_ttl > 0:
+                status += f"| {self.message} "
+                self.message_ttl -= 1
+            attr = curses.color_pair(3) | curses.A_BOLD if self.use_color else curses.A_REVERSE
+            try:
+                self.stdscr.addstr(status_y, 0, status.ljust(max_w - 1)[:max_w - 1], attr)
+            except curses.error:
+                pass
+
+        # Help bar
+        help_y = max_h - 1
+        if help_y > 0:
+            help_text = (
+                " [Space]Run [S]tep [R]eset | "
+                "[P/N]Preset [\\[/\\]]Steps/tick [F/D]Speed | [Shift+T]Exit [Q]uit"
+            )
+            try:
+                self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+
     # --- brush mode ---
 
     def _brush_offsets(self) -> list[tuple[int, int]]:
@@ -6422,6 +6879,8 @@ class App:
             self._draw_boids(max_h, max_w, grid_rows, grid_cols)
         elif self.nca_mode:
             self._draw_nca(max_h, max_w, grid_rows, grid_cols)
+        elif self.wfc_mode:
+            self._draw_wfc(max_h, max_w, grid_rows, grid_cols)
         elif self.split_mode:
             self._draw_split(max_h, max_w, grid_rows, grid_cols)
         elif self.blueprint_mode:
