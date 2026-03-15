@@ -490,6 +490,272 @@ class PatternDetector:
 
 
 # ---------------------------------------------------------------------------
+# Genetic Algorithm Pattern Evolver
+# ---------------------------------------------------------------------------
+
+class PatternEvolver:
+    """Breeds cellular automaton patterns using a genetic algorithm.
+
+    Each individual is a set of (row, col) offsets within a bounded region.
+    Fitness is evaluated by simulating the pattern for a number of generations
+    and measuring one of: longevity, max population, or symmetry.
+    """
+
+    FITNESS_CRITERIA = ["longevity", "max_population", "symmetry"]
+    FITNESS_LABELS = {
+        "longevity": "Longevity (survive longest)",
+        "max_population": "Max Population (peak cells)",
+        "symmetry": "Symmetry (bilateral balance)",
+    }
+
+    def __init__(
+        self,
+        region_w: int = 20,
+        region_h: int = 20,
+        pop_size: int = 20,
+        sim_steps: int = 200,
+        mutation_rate: float = 0.05,
+        density: float = 0.3,
+        birth: set[int] | None = None,
+        survival: set[int] | None = None,
+    ):
+        self.region_w = region_w
+        self.region_h = region_h
+        self.pop_size = pop_size
+        self.sim_steps = sim_steps
+        self.mutation_rate = mutation_rate
+        self.density = density
+        self.birth = birth or {3}
+        self.survival = survival or {2, 3}
+
+        self.population: list[set[tuple[int, int]]] = []
+        self.fitness_scores: list[float] = []
+        self.ga_generation = 0
+        self.criterion = "longevity"
+        self.best_pattern: set[tuple[int, int]] = set()
+        self.best_fitness: float = 0.0
+        self.best_ever_pattern: set[tuple[int, int]] = set()
+        self.best_ever_fitness: float = 0.0
+        self.eval_index = 0  # which individual we're evaluating next
+        self.phase = "evaluating"  # "evaluating" or "breeding"
+
+    def initialize(self) -> None:
+        """Create initial random population."""
+        self.population = []
+        for _ in range(self.pop_size):
+            self.population.append(self._random_individual())
+        self.fitness_scores = [0.0] * self.pop_size
+        self.ga_generation = 0
+        self.eval_index = 0
+        self.phase = "evaluating"
+        self.best_pattern = set()
+        self.best_fitness = 0.0
+        self.best_ever_pattern = set()
+        self.best_ever_fitness = 0.0
+
+    def _random_individual(self) -> set[tuple[int, int]]:
+        """Generate a random pattern within the region."""
+        cells = set()
+        for r in range(self.region_h):
+            for c in range(self.region_w):
+                if random.random() < self.density:
+                    cells.add((r, c))
+        return cells
+
+    def evaluate_one(self) -> tuple[int, float]:
+        """Evaluate the next individual. Returns (index, fitness).
+
+        Call this repeatedly until eval_index wraps to trigger breeding.
+        """
+        idx = self.eval_index
+        pattern = self.population[idx]
+        fitness = self._compute_fitness(pattern)
+        self.fitness_scores[idx] = fitness
+
+        self.eval_index += 1
+        if self.eval_index >= self.pop_size:
+            self.phase = "breeding"
+
+        return idx, fitness
+
+    def breed_next_generation(self) -> None:
+        """Select, crossover, and mutate to create a new generation."""
+        # Find best of this generation
+        best_idx = max(range(self.pop_size), key=lambda i: self.fitness_scores[i])
+        self.best_pattern = self.population[best_idx]
+        self.best_fitness = self.fitness_scores[best_idx]
+
+        if self.best_fitness > self.best_ever_fitness:
+            self.best_ever_fitness = self.best_fitness
+            self.best_ever_pattern = set(self.best_pattern)
+
+        # Build next generation
+        new_pop: list[set[tuple[int, int]]] = []
+
+        # Elitism: keep top 2
+        ranked = sorted(range(self.pop_size), key=lambda i: self.fitness_scores[i], reverse=True)
+        new_pop.append(set(self.population[ranked[0]]))
+        new_pop.append(set(self.population[ranked[1]]))
+
+        # Fill rest via tournament selection + crossover + mutation
+        while len(new_pop) < self.pop_size:
+            parent_a = self._tournament_select()
+            parent_b = self._tournament_select()
+            child = self._crossover(parent_a, parent_b)
+            child = self._mutate(child)
+            new_pop.append(child)
+
+        self.population = new_pop
+        self.fitness_scores = [0.0] * self.pop_size
+        self.ga_generation += 1
+        self.eval_index = 0
+        self.phase = "evaluating"
+
+    def _compute_fitness(self, pattern: set[tuple[int, int]]) -> float:
+        """Simulate pattern and return fitness score."""
+        if not pattern:
+            return 0.0
+
+        # Build an isolated simulation grid (unbounded, using dict tracking)
+        cells = set(pattern)
+        birth = self.birth
+        survival = self.survival
+
+        max_pop = len(cells)
+        last_alive_gen = 0
+        # Track states for cycle detection
+        seen_states: dict[frozenset[tuple[int, int]], int] = {}
+        symmetry_sum = 0.0
+        symmetry_count = 0
+
+        for gen in range(1, self.sim_steps + 1):
+            state_key = frozenset(cells)
+            if state_key in seen_states:
+                # Entered a cycle — pattern is stable/oscillating
+                cycle_len = gen - seen_states[state_key]
+                if self.criterion == "longevity":
+                    # Reward reaching a stable cycle: full marks + bonus for cycle
+                    return float(self.sim_steps + cycle_len)
+                elif self.criterion == "max_population":
+                    return float(max_pop)
+                elif self.criterion == "symmetry":
+                    return symmetry_sum / max(symmetry_count, 1)
+            seen_states[state_key] = gen
+
+            # Tick
+            neighbor_count: Counter[tuple[int, int]] = Counter()
+            for r, c in cells:
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        neighbor_count[(r + dr, c + dc)] += 1
+            new_cells: set[tuple[int, int]] = set()
+            for pos, count in neighbor_count.items():
+                if pos in cells:
+                    if count in survival:
+                        new_cells.add(pos)
+                else:
+                    if count in birth:
+                        new_cells.add(pos)
+            cells = new_cells
+
+            if not cells:
+                break
+
+            pop = len(cells)
+            if pop > max_pop:
+                max_pop = pop
+            last_alive_gen = gen
+
+            # Measure symmetry periodically
+            if gen % 10 == 0 and cells:
+                symmetry_sum += self._measure_symmetry(cells)
+                symmetry_count += 1
+
+        if self.criterion == "longevity":
+            return float(last_alive_gen)
+        elif self.criterion == "max_population":
+            return float(max_pop)
+        elif self.criterion == "symmetry":
+            return symmetry_sum / max(symmetry_count, 1)
+        return 0.0
+
+    @staticmethod
+    def _measure_symmetry(cells: set[tuple[int, int]]) -> float:
+        """Measure bilateral symmetry (0.0 to 1.0) of a cell pattern."""
+        if not cells:
+            return 0.0
+        min_r = min(r for r, _ in cells)
+        max_r = max(r for r, _ in cells)
+        min_c = min(c for _, c in cells)
+        max_c = max(c for _, c in cells)
+        center_r = (min_r + max_r) / 2.0
+        center_c = (min_c + max_c) / 2.0
+
+        total = len(cells)
+        h_matches = 0  # horizontal symmetry
+        v_matches = 0  # vertical symmetry
+        for r, c in cells:
+            # Horizontal mirror
+            mr = int(round(2 * center_r - r))
+            if (mr, c) in cells:
+                h_matches += 1
+            # Vertical mirror
+            mc = int(round(2 * center_c - c))
+            if (r, mc) in cells:
+                v_matches += 1
+
+        return max(h_matches, v_matches) / total
+
+    def _tournament_select(self, k: int = 3) -> set[tuple[int, int]]:
+        """Select an individual via tournament selection."""
+        candidates = random.sample(range(self.pop_size), min(k, self.pop_size))
+        winner = max(candidates, key=lambda i: self.fitness_scores[i])
+        return self.population[winner]
+
+    def _crossover(self, a: set[tuple[int, int]], b: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        """Combine two parents using uniform crossover over the region."""
+        child: set[tuple[int, int]] = set()
+        all_positions = a | b
+        for pos in all_positions:
+            if random.random() < 0.5:
+                child.add(pos)
+        return child
+
+    def _mutate(self, individual: set[tuple[int, int]]) -> set[tuple[int, int]]:
+        """Randomly flip cells within the region."""
+        result = set(individual)
+        for r in range(self.region_h):
+            for c in range(self.region_w):
+                if random.random() < self.mutation_rate:
+                    pos = (r, c)
+                    if pos in result:
+                        result.discard(pos)
+                    else:
+                        result.add(pos)
+        return result
+
+    def get_current_pattern(self) -> set[tuple[int, int]]:
+        """Return the pattern currently being evaluated (for display)."""
+        if self.eval_index < self.pop_size:
+            return self.population[self.eval_index]
+        return self.best_pattern
+
+    def status_text(self) -> str:
+        """Return a short status string for the status bar."""
+        crit_short = {
+            "longevity": "LONGEV",
+            "max_population": "MAXPOP",
+            "symmetry": "SYMM",
+        }[self.criterion]
+        return (
+            f"GA Gen:{self.ga_generation} Eval:{self.eval_index}/{self.pop_size} "
+            f"Best:{self.best_fitness:.0f} Ever:{self.best_ever_fitness:.0f} [{crit_short}]"
+        )
+
+
+# ---------------------------------------------------------------------------
 # App — curses UI controller
 # ---------------------------------------------------------------------------
 
@@ -539,6 +805,9 @@ class App:
         # Heatmap mode state
         self.heatmap_mode = False
         self.heatmap: Counter[tuple[int, int]] = Counter()  # cumulative alive ticks per cell
+        # Evolve (genetic algorithm) mode state
+        self.evolve_mode = False
+        self.evolver: PatternEvolver | None = None
 
     def _refresh_patterns(self) -> None:
         """Reload merged pattern library from built-in + custom patterns."""
@@ -555,7 +824,9 @@ class App:
         while True:
             if not self._handle_input():
                 break
-            if self.running and self.history_pos == -1:
+            if self.evolve_mode:
+                self._evolve_tick()
+            elif self.running and self.history_pos == -1:
                 self._record_history()
                 self._record_population()
                 # Accumulate heatmap before tick (count current alive cells)
@@ -803,6 +1074,22 @@ class App:
             else:
                 self._set_message("Heatmap OFF")
 
+        # Evolve (genetic algorithm) mode
+        elif key == ord("a"):
+            if self.evolve_mode:
+                self._stop_evolve()
+            else:
+                self._start_evolve()
+
+        # Change evolve fitness criterion on the fly
+        elif self.evolve_mode and self.evolver and key in (ord("1"), ord("2"), ord("3")):
+            criteria = ["longevity", "max_population", "symmetry"]
+            idx = key - ord("1")
+            self.evolver.criterion = criteria[idx]
+            self._set_message(
+                f"Evolve goal: {PatternEvolver.FITNESS_LABELS[criteria[idx]]}"
+            )
+
         # Brush size with [z/Z] keys: z shrink, Z grow (shift+z)
         elif key == ord("z"):
             self.brush_size = max(1, self.brush_size - 1)
@@ -1018,6 +1305,155 @@ class App:
             self.pattern_idx = None
         self._set_message(f"Deleted custom pattern '{name}'")
 
+    # --- evolve (genetic algorithm) mode ---
+
+    def _start_evolve(self) -> None:
+        """Prompt for fitness criterion and launch the genetic algorithm."""
+        self.running = False
+        choice = self._menu_prompt(
+            "Evolve — select fitness goal:",
+            ["1) Longevity (survive longest)",
+             "2) Max Population (peak cells)",
+             "3) Symmetry (bilateral balance)"],
+        )
+        if choice < 0:
+            self._set_message("Evolve cancelled")
+            return
+
+        criteria = ["longevity", "max_population", "symmetry"]
+        criterion = criteria[choice]
+
+        # Determine region size (~1/4 of grid, clamped)
+        rw = max(10, min(30, self.grid.width // 2))
+        rh = max(10, min(30, self.grid.height // 2))
+
+        evolver = PatternEvolver(
+            region_w=rw,
+            region_h=rh,
+            pop_size=20,
+            sim_steps=200,
+            mutation_rate=0.05,
+            density=0.25,
+            birth=set(self.grid.birth),
+            survival=set(self.grid.survival),
+        )
+        evolver.criterion = criterion
+        evolver.initialize()
+
+        self.evolver = evolver
+        self.evolve_mode = True
+        self.grid.clear()
+        self.generation = 0
+        self.history.clear()
+        self.history_pos = -1
+        self.pop_history.clear()
+        self.heatmap.clear()
+
+        # Place the first individual on the grid for visualization
+        self._place_evolver_pattern(evolver.get_current_pattern())
+        self._set_message(
+            f"EVOLVING for {PatternEvolver.FITNESS_LABELS[criterion]} — [A] stop, [1/2/3] change goal"
+        )
+
+    def _stop_evolve(self) -> None:
+        """Stop evolve mode, keeping the best pattern on the grid."""
+        if self.evolver and self.evolver.best_ever_pattern:
+            self.grid.clear()
+            self._place_evolver_pattern(self.evolver.best_ever_pattern)
+            self._set_message(
+                f"Evolve stopped — best pattern placed (fitness: {self.evolver.best_ever_fitness:.0f})"
+            )
+        else:
+            self._set_message("Evolve stopped")
+        self.evolve_mode = False
+        self.evolver = None
+
+    def _evolve_tick(self) -> None:
+        """Advance one step of the genetic algorithm per frame."""
+        if not self.evolver:
+            return
+
+        if self.evolver.phase == "evaluating":
+            idx, fitness = self.evolver.evaluate_one()
+            # Show the pattern being evaluated on the grid
+            self.grid.clear()
+            self._place_evolver_pattern(self.evolver.population[idx])
+
+            # Check if we finished evaluating all individuals
+            if self.evolver.phase == "breeding":
+                self.evolver.breed_next_generation()
+                # Show the best pattern from the completed generation
+                self.grid.clear()
+                self._place_evolver_pattern(self.evolver.best_pattern)
+        elif self.evolver.phase == "breeding":
+            # Shouldn't normally reach here, but handle it
+            self.evolver.breed_next_generation()
+
+    def _place_evolver_pattern(self, pattern: set[tuple[int, int]]) -> None:
+        """Place an evolver pattern centered on the grid."""
+        if not pattern:
+            return
+        # Center the pattern on the grid
+        min_r = min(r for r, _ in pattern)
+        min_c = min(c for _, c in pattern)
+        max_r = max(r for r, _ in pattern)
+        max_c = max(c for _, c in pattern)
+        pat_h = max_r - min_r + 1
+        pat_w = max_c - min_c + 1
+        offset_r = (self.grid.height - pat_h) // 2 - min_r
+        offset_c = (self.grid.width - pat_w) // 2 - min_c
+        for r, c in pattern:
+            nr, nc = r + offset_r, c + offset_c
+            if 0 <= nr < self.grid.height and 0 <= nc < self.grid.width:
+                self.grid.cells.add((nr, nc))
+                self.grid.ages[(nr, nc)] = 1
+        # Center cursor on pattern
+        self.cursor_r = self.grid.height // 2
+        self.cursor_c = self.grid.width // 2
+
+    def _menu_prompt(self, title: str, options: list[str]) -> int:
+        """Show a numbered menu and return the selected index (0-based), or -1 on cancel."""
+        curses.curs_set(0)
+        self.stdscr.nodelay(False)
+        max_h, max_w = self.stdscr.getmaxyx()
+
+        while True:
+            # Draw the menu at the bottom of the screen
+            start_y = max(0, max_h - len(options) - 3)
+            try:
+                self.stdscr.move(start_y, 0)
+                self.stdscr.clrtoeol()
+                self.stdscr.addstr(
+                    start_y, 0, f" {title}"[:max_w - 1],
+                    curses.A_BOLD | (curses.color_pair(3) if self.use_color else curses.A_REVERSE),
+                )
+                for i, opt in enumerate(options):
+                    y = start_y + 1 + i
+                    if y < max_h:
+                        self.stdscr.move(y, 0)
+                        self.stdscr.clrtoeol()
+                        self.stdscr.addstr(y, 0, f"  {opt}"[:max_w - 1])
+                esc_y = start_y + 1 + len(options)
+                if esc_y < max_h:
+                    self.stdscr.move(esc_y, 0)
+                    self.stdscr.clrtoeol()
+                    self.stdscr.addstr(esc_y, 0, "  [Esc] Cancel"[:max_w - 1], curses.A_DIM)
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+
+            ch = self.stdscr.getch()
+            if ch == 27:  # Escape
+                self.stdscr.nodelay(True)
+                self._update_timeout()
+                return -1
+            if ord("1") <= ch <= ord("9"):
+                idx = ch - ord("1")
+                if idx < len(options):
+                    self.stdscr.nodelay(True)
+                    self._update_timeout()
+                    return idx
+
     def _text_prompt(self, prompt: str) -> str:
         """Show a text input prompt at the bottom of the screen. Returns entered text or empty string."""
         curses.curs_set(1)
@@ -1185,9 +1621,10 @@ class App:
             rule_info = f"{rule_name} {rs}"
             brush_section = f" | Brush: {self._brush_label()}" if self.brush_active else ""
             heat_section = f" | HEATMAP({len(self.heatmap)} cells)" if self.heatmap_mode else ""
+            evolve_section = f" | {self.evolver.status_text()}" if self.evolve_mode and self.evolver else ""
             status = (
                 f" Gen: {self.generation} | Cells: {len(self.grid.cells)}{spark_section} | "
-                f"Rule: {rule_info} | Speed: {self.speed} | {topo} | {hist_info} | {state}{brush_section}{heat_section} "
+                f"Rule: {rule_info} | Speed: {self.speed} | {topo} | {hist_info} | {state}{brush_section}{heat_section}{evolve_section} "
             )
             if self.message_ttl > 0:
                 status += f"| {self.message} "
@@ -1210,7 +1647,7 @@ class App:
                 f" [Space]Run [S]tep [R]and [C]lear [Q]uit | "
                 f"[P/N]Pat: {pat_name}{custom_tag} [Enter]Place [Esc]Desel |"
                 f"{brush_info} | "
-                f"[F/G]Rule [D]ash [H]eat [B]lue [X]Del [L]RLE [+/-]Spd [T]orus [</>]Rew [W]Save [O]Load"
+                f"[F/G]Rule [D]ash [H]eat [A]Evolve [B]lue [X]Del [L]RLE [+/-]Spd [T]orus [</>]Rew [W]Save [O]Load"
             )
             try:
                 self.stdscr.addstr(help_y, 0, help_text[:max_w - 1], curses.A_DIM)
